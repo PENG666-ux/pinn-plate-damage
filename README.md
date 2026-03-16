@@ -9,7 +9,7 @@ structural damage in thin plates from vibration response data.
 
 The effective areal-density field of a damaged plate is modelled as:
 
-$$\sigma^*(x,y) = \rho h + \sum_{k=1}^{K} \alpha_k\,\Delta\sigma\;\text{sigmoid}\!\left[\beta\!\left(r_k^2 - d_k^2(x,y)\right)\right]$$
+$$\sigma^*(x,y) = \rho h + \sum_{k=1}^{K} \alpha_k\,\Delta\sigma\;\text{sigmoid}\left[\beta\left(r_k^2 - d_k^2(x,y)\right)\right]$$
 
 Each damage site $k$ is described by four learnable parameters: centre $(x_k, y_k)$, radius $r_k$, and intensity $\alpha_k$. Training proceeds in three stages:
 
