@@ -4,6 +4,9 @@ A Physics-Informed Neural Network (PINN) framework for identifying localised
 structural damage in thin plates from vibration response data.
 
 ---
+![Python](https://img.shields.io/badge/Python-3.8+-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-orange)
+![CUDA](https://img.shields.io/badge/CUDA-11.8+-76B900?logo=nvidia)
 
 ## Method Overview
 
