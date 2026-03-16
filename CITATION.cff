@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "PINN-Based Structural Damage Identification for Kirchhoff-Love Plates"
+authors:
+  - family-names: "ku"
+    given-names: "le"
+version: 1.0.0
+date-released: 2025-03-16
+url: "https://github.com/PENG666-ux/pinn-plate-damage"
