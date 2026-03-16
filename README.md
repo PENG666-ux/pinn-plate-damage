@@ -17,7 +17,6 @@ Each damage site $k$ is described by four learnable parameters: centre $(x_k, y_
 **Stage 2** — Joint optimisation of network weights and damage parameters on damaged measurements.  
 **Stage 3** — Damage parameter refinement with damage-focused adaptive collocation sampling.
 
-For the full mathematical formulation see [`docs/method.md`](docs/method.md).
 
 ---
 
