@@ -1,0 +1,36 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+venv/
+*.egg-info/
+
+# ── Data (COMSOL exports – usually large, do not commit) ──────────────────────
+data/healthy/
+data/damaged/
+*.csv
+
+# ── Training outputs ──────────────────────────────────────────────────────────
+*.pth
+*.npz
+damage_evolution/
+stage_*_snapshots/
+
+# ── Generated plots ───────────────────────────────────────────────────────────
+*.png
+*.gif
+# Allow plots committed intentionally to results/
+!results/*.png
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
