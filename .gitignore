@@ -14,7 +14,9 @@ data/damaged/
 
 # ── Training outputs ──────────────────────────────────────────────────────────
 *.pth
+*.pt
 *.npz
+results/*.json
 damage_evolution/
 stage_*_snapshots/
 

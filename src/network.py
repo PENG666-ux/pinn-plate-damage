@@ -14,6 +14,14 @@ class DNN(nn.Module):
         super().__init__()
         self.laaf = laaf
         self.dtype = dtype
+        activations = {"tanh": torch.tanh, "silu": torch.nn.functional.silu,
+                       "gelu": torch.nn.functional.gelu}
+        try:
+            self.activation = activations[activation.lower()]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported activation {activation!r}; choose {tuple(activations)}") from exc
+        if len(layers) < 2 or any(int(n) <= 0 for n in layers):
+            raise ValueError("layers must contain at least two positive dimensions")
 
         self.weights = nn.ParameterList()
         self.biases  = nn.ParameterList()
@@ -39,7 +47,7 @@ class DNN(nn.Module):
         for i, (W, b) in enumerate(zip(self.weights[:-1], self.biases[:-1])):
             h = torch.mm(h, W) + b
             if self.laaf:
-                h = torch.tanh(h * self.alphas[i])
+                h = self.activation(h * self.alphas[i])
             else:
-                h = torch.tanh(h)
+                h = self.activation(h)
         return torch.mm(h, self.weights[-1]) + self.biases[-1]

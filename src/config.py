@@ -4,6 +4,9 @@
 
 import os
 
+# Increment when the checkpoint schema or governing equation changes.
+SCHEMA_VERSION = 2
+
 # ── Network architecture ───────────────────────────────────────────────────────
 F_IN        = 3          # inputs: (t, x, y)
 F_OUT       = 1          # output: normalised deflection w
@@ -35,9 +38,12 @@ K_MAX          = 3
 INIT_POSITIONS = [(0.5, 0.5), (0.3, 0.7), (0.7, 0.3)]
 INIT_RADII_MM  = [9.0, 3.0, 6.0]
 INIT_ALPHA     = [0.5, 0.5, 0.5]
+R_MIN_MM       = 1.0
+R_MAX_MM       = 15.0
 
 # ── Loss weights ───────────────────────────────────────────────────────────────
 W_PDE       = 1.0
+W_BC        = 1.0
 W_DATA_S1   = 10000.0
 W_DATA_S2   = 100.0
 W_DATA_S3   = 100.0
@@ -48,6 +54,7 @@ W_REG_G_S3  = 1e-4
 
 # ── Sampling ───────────────────────────────────────────────────────────────────
 N_PDE            = 20000
+N_BC             = 2000
 PDE_LBFGS_SUBSET = 5000
 GRID_SIZE        = 15
 N_TIME_POINTS    = 80
@@ -64,6 +71,14 @@ S2_EARLY_PHASE           = 2000
 # ── Misc ───────────────────────────────────────────────────────────────────────
 F_MNTR = 50
 R_SEED = 1234
+DETERMINISTIC = True
+
+# Hold out complete spatial sensor locations to avoid temporal leakage.
+VAL_FRACTION  = 0.15
+TEST_FRACTION = 0.15
+
+# Supported value: "simply_supported" (w=0 and zero bending moment).
+BOUNDARY_CONDITION = "simply_supported"
 
 # ── Data paths ─────────────────────────────────────────────────────────────────
 # Point to folders containing COMSOL-exported CSV files (columns: t, x, y, u).
@@ -81,15 +96,19 @@ def get_config():
         X_physical=X_PHYSICAL, Y_physical=Y_PHYSICAL, T_physical=T_PHYSICAL,
         delta_sigma=DELTA_SIGMA, beta=BETA, K_max=K_MAX,
         init_positions=INIT_POSITIONS, init_radii_mm=INIT_RADII_MM, init_alpha=INIT_ALPHA,
-        w_pde=W_PDE,
+        r_min_mm=R_MIN_MM, r_max_mm=R_MAX_MM,
+        w_pde=W_PDE, w_bc=W_BC,
         w_data_s1=W_DATA_S1, w_data_s2=W_DATA_S2, w_data_s3=W_DATA_S3,
         w_reg_r_s2=W_REG_R_S2, w_reg_g_s2=W_REG_G_S2,
         w_reg_r_s3=W_REG_R_S3, w_reg_g_s3=W_REG_G_S3,
-        N_PDE=N_PDE, pde_lbfgs_subset=PDE_LBFGS_SUBSET,
+        N_PDE=N_PDE, N_BC=N_BC, pde_lbfgs_subset=PDE_LBFGS_SUBSET,
         grid_size=GRID_SIZE, num_time_points=N_TIME_POINTS, sampling_tol=SAMPLING_TOL,
         s1_adam=S1_ADAM_EPOCHS, s1_lbfgs=S1_LBFGS_EPOCHS,
         s2_epochs=S2_EPOCHS, s3_epochs=S3_EPOCHS,
         adaptive_interval=ADAPTIVE_UPDATE_INTERVAL, s2_early_phase=S2_EARLY_PHASE,
-        f_mntr=F_MNTR, r_seed=R_SEED, t_max_star=1.0,
+        f_mntr=F_MNTR, r_seed=R_SEED, deterministic=DETERMINISTIC,
+        val_fraction=VAL_FRACTION, test_fraction=TEST_FRACTION,
+        boundary_condition=BOUNDARY_CONDITION, schema_version=SCHEMA_VERSION,
+        t_max_star=1.0,
         data_healthy=DATA_HEALTHY, data_damage=DATA_DAMAGE,
     )

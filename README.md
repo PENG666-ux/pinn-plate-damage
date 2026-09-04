@@ -1,58 +1,85 @@
-# PINN-Based Structural Damage Identification for Kirchhoff-Love Plates
+# PINN identification of localized mass perturbations in thin plates
 
-A Physics-Informed Neural Network (PINN) framework for identifying localised
-structural damage in thin plates from vibration response data.
+[![tests](https://github.com/PENG666-ux/pinn-plate-damage/actions/workflows/tests.yml/badge.svg)](https://github.com/PENG666-ux/pinn-plate-damage/actions/workflows/tests.yml)
 
----
-![Python](https://img.shields.io/badge/Python-3.8+-blue)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-orange)
-![CUDA](https://img.shields.io/badge/CUDA-11.8+-76B900?logo=nvidia)
+This repository implements a physics-informed neural network (PINN) for an
+inverse Kirchhoff-Love plate problem. It estimates the centres, radii, and
+amplitudes of smooth, localized **areal-density perturbations** from transverse
+vibration measurements.
 
-## Method Overview
+> Scientific scope: the current model changes inertia, not bending stiffness.
+> It is therefore a mass-perturbation surrogate and must not be interpreted as
+> a general crack, delamination, or material-stiffness damage model without an
+> independently justified constitutive extension.
 
-The effective areal-density field of a damaged plate is modelled as:
+## What is verified
 
-$$\sigma^*(x,y) = \rho h + \sum_{k=1}^{K} \alpha_k\,\Delta\sigma\;\text{sigmoid}\left[\beta\left(r_k^2 - d_k^2(x,y)\right)\right]$$
+- The dimensionless biharmonic operator retains the correct aspect-ratio terms
+  for rectangular plates.
+- Simply-supported displacement and bending-moment conditions are explicit
+  loss terms.
+- A closed-form healthy-plate mode is used as a manufactured-solution test.
+- Complete sensor locations, rather than individual time rows, are assigned to
+  train/validation/test partitions to prevent temporal leakage.
+- Sampling, data partitions, and L-BFGS objectives are deterministic under a
+  recorded seed.
+- Checkpoints record the code schema, configuration hash, normalization,
+  optimizer state, histories, runtime versions, and random-number states.
 
-Each damage site $k$ is described by four learnable parameters: centre $(x_k, y_k)$, radius $r_k$, and intensity $\alpha_k$. Training proceeds in three stages:
+These checks establish implementation consistency; they do **not** establish
+identifiability or experimental validity for a particular dataset.
 
-**Stage 1** — Learn healthy-plate dynamics from undamaged measurements (Adam + L-BFGS).  
-**Stage 2** — Joint optimisation of network weights and damage parameters on damaged measurements.  
-**Stage 3** — Damage parameter refinement with damage-focused adaptive collocation sampling.
+## Installation and tests
 
-
----
-
-## Repository Structure
-
-```
-├── src/
-│   ├── config.py      # All hyper-parameters and physical constants
-│   ├── network.py     # Fully-connected DNN
-│   ├── sampling.py    # Collocation-point generation and data loading
-│   ├── pinn.py        # PINN class: forward pass, PDE residual, training loops
-│   ├── plot.py        # Visualisation functions
-│   └── main.py        # Training orchestration (Stages 1 → 2 → 3)
-├── docs/
-│   ├── method.md      # Mathematical background
-│   └── quickstart.md  # Usage and configuration guide
-├── data/
-│   └── example/
-│       └── README.md  # Expected CSV format
-├── results/           # Commit representative output figures here
-├── requirements.txt
-└── LICENSE
-```
-
----
-
-## Requirements
-
-- Python ≥ 3.8
-- PyTorch ≥ 2.0 (CUDA recommended)
-- NumPy, SciPy, Matplotlib, Pandas
-- imageio (optional, for GIF output)
+Python 3.10 or newer is required.
 
 ```bash
-pip install -r requirements.txt
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# Linux/macOS: source .venv/bin/activate
+pip install -e ".[test]"
+pytest
 ```
+
+## Data contract
+
+Place healthy and perturbed measurements in separate folders. Every CSV must
+contain numeric, finite columns `t,x,y,u`. All files in a folder are combined
+in sorted filename order. Choose the coordinate convention explicitly:
+
+- `--coordinate-mode normalized`: `t,x,y` are already in `[0,1]`.
+- `--coordinate-mode physical`: time is in seconds and coordinates are in
+  metres; values are divided by `T_PHYSICAL`, `X_PHYSICAL`, and `Y_PHYSICAL`.
+
+## Run
+
+```bash
+python -m src.main \
+  --healthy-data data/healthy \
+  --damaged-data data/damaged \
+  --coordinate-mode physical \
+  --output-dir results/run-1234 \
+  --seed 1234
+```
+
+Use `--smoke-test` to exercise all three stages with one Adam epoch each. A
+full run writes immutable split counts, held-out metrics, checkpoints, inferred
+parameters, and figures to the selected output directory.
+
+For paper-quality evidence, repeat the complete pipeline with multiple
+pre-registered seeds and report all runs (median and dispersion), a no-damage
+negative control, noise sweeps, sensor-density ablations, and synthetic cases
+with known parameters. See [method details](docs/method.md) and the
+[validation protocol](docs/validation.md).
+
+## Reproducibility cautions
+
+GPU kernels can still differ across hardware or PyTorch/CUDA releases. The
+checkpoint records the runtime version, and deterministic algorithms are
+requested with warnings enabled. Archive the raw data, exact commit, config,
+and environment alongside published results. Do not select the best random
+seed or tune hyperparameters against the test partition.
+
+## Citation and license
+
+Citation metadata are provided in `CITATION.cff`. The code is MIT licensed.

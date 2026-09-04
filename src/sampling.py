@@ -1,216 +1,200 @@
-# sampling.py
+"""Deterministic sampling and leakage-resistant dataset utilities."""
+
+from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
 
 try:
     from scipy.stats import qmc
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
+except ImportError:  # pragma: no cover - scipy is a declared dependency
+    qmc = None
 
 
-# ---------------------------------------------------------------------------
-# Collocation point generators
-# ---------------------------------------------------------------------------
+REQUIRED_COLUMNS = ("t", "x", "y", "u")
 
-def lhs_points(n, t_range=(0., 1.), x_range=(0., 1.), y_range=(0., 1.)):
-    """Latin hypercube samples over (t, x, y)."""
-    if SCIPY_AVAILABLE:
-        sampler = qmc.LatinHypercube(d=3)
-        s = sampler.random(n=n)
-        s = qmc.scale(s, [t_range[0], x_range[0], y_range[0]],
-                         [t_range[1], x_range[1], y_range[1]])
+
+def _rng(seed=None) -> np.random.Generator:
+    return seed if isinstance(seed, np.random.Generator) else np.random.default_rng(seed)
+
+
+def lhs_points(n: int, t_range=(0.0, 1.0), x_range=(0.0, 1.0),
+               y_range=(0.0, 1.0), seed=None):
+    """Latin-hypercube samples over ``(t, x, y)`` with an explicit seed."""
+    if n < 0:
+        raise ValueError("n must be non-negative")
+    if n == 0:
+        empty = np.empty((0, 1), dtype=np.float64)
+        return empty.copy(), empty.copy(), empty.copy()
+    bounds = (t_range, x_range, y_range)
+    if any(lo >= hi for lo, hi in bounds):
+        raise ValueError("every sampling range must satisfy lower < upper")
+    rng = _rng(seed)
+    if qmc is not None:
+        sample = qmc.LatinHypercube(d=3, seed=rng).random(n=n)
+        sample = qmc.scale(sample, [r[0] for r in bounds], [r[1] for r in bounds])
     else:
-        s = np.random.uniform(
-            [t_range[0], x_range[0], y_range[0]],
-            [t_range[1], x_range[1], y_range[1]],
-            size=(n, 3)
-        )
-    return s[:, 0:1], s[:, 1:2], s[:, 2:3]
+        sample = rng.uniform([r[0] for r in bounds], [r[1] for r in bounds], (n, 3))
+    return tuple(sample[:, i:i + 1].astype(np.float64) for i in range(3))
 
 
-def boundary_points(n):
-    """Uniform samples on the four spatial boundaries, t uniform in [0,1]."""
-    n_per = n // 4
-    segs = []
-    for _ in range(n_per):       # x=0
-        segs.append([np.random.uniform(), 0., np.random.uniform()])
-    for _ in range(n_per):       # x=1
-        segs.append([np.random.uniform(), 1., np.random.uniform()])
-    for _ in range(n_per):       # y=0
-        segs.append([np.random.uniform(), np.random.uniform(), 0.])
-    for _ in range(n - 3 * n_per):  # y=1
-        segs.append([np.random.uniform(), np.random.uniform(), 1.])
-    arr = np.array(segs, dtype=np.float64)
-    return arr[:, 0:1], arr[:, 1:2], arr[:, 2:3]
-
-
-def damage_focused_points(n, centres, radii, weights, sigma_factor=2.0):
-    """Gaussian samples centred on active damage sites, weighted by alpha."""
-    weights = np.asarray(weights, dtype=float)
-    weights /= weights.sum()
-    t_list, x_list, y_list = [], [], []
-    for (cx, cy), r, w in zip(centres, radii, weights):
-        k = max(int(n * w), 10)
-        sigma = max(r * sigma_factor, 0.05)
-        xs = np.clip(np.random.normal(cx, sigma, k), 0., 1.)
-        ys = np.clip(np.random.normal(cy, sigma, k), 0., 1.)
-        ts = np.random.uniform(0., 1., k)
-        t_list.append(ts.reshape(-1, 1))
-        x_list.append(xs.reshape(-1, 1))
-        y_list.append(ys.reshape(-1, 1))
-    t = np.vstack(t_list)
-    x = np.vstack(x_list)
-    y = np.vstack(y_list)
-    if len(t) > n:
-        idx = np.random.choice(len(t), n, replace=False)
-        t, x, y = t[idx], x[idx], y[idx]
-    return t, x, y
-
-
-def damage_focused_points_hires(n, centres, radii, weights):
-    """High-resolution sampling: 70% inside the damage disc, 30% near edge."""
-    weights = np.asarray(weights, dtype=float)
-    weights /= weights.sum()
-    t_list, x_list, y_list = [], [], []
-    for (cx, cy), r, w in zip(centres, radii, weights):
-        k = max(int(n * w), 20)
-        n_in = int(k * 0.7)
-        n_out = k - n_in
-        # inner disc
-        r_samp = r * np.sqrt(np.random.uniform(0, 1, n_in))
-        theta = np.random.uniform(0, 2 * np.pi, n_in)
-        xs_in = np.clip(cx + r_samp * np.cos(theta), 0., 1.)
-        ys_in = np.clip(cy + r_samp * np.sin(theta), 0., 1.)
-        # outer annulus
-        sigma = max(r * 1.5, 0.03)
-        xs_out = np.clip(np.random.normal(cx, sigma, n_out), 0., 1.)
-        ys_out = np.clip(np.random.normal(cy, sigma, n_out), 0., 1.)
-        xs = np.concatenate([xs_in, xs_out])
-        ys = np.concatenate([ys_in, ys_out])
-        ts = np.random.uniform(0., 1., k)
-        t_list.append(ts.reshape(-1, 1))
-        x_list.append(xs.reshape(-1, 1))
-        y_list.append(ys.reshape(-1, 1))
-    t = np.vstack(t_list)
-    x = np.vstack(x_list)
-    y = np.vstack(y_list)
-    if len(t) > n:
-        idx = np.random.choice(len(t), n, replace=False)
-        t, x, y = t[idx], x[idx], y[idx]
-    return t, x, y
-
-
-def generate_pde_points(N, stage=1, epoch=0, alpha_vals=None,
-                        x_vals=None, y_vals=None, r_vals=None,
-                        stage2_switch=2000):
-    """
-    Generate collocation points according to current stage and epoch.
-
-    Stage 1 / Stage 2 early  : 80 % LHS + 20 % boundary
-    Stage 2 late             : 60 % damage-focused + 30 % uniform + 10 % boundary
-    Stage 3                  : 80 % damage-focused (hi-res) + 15 % uniform + 5 % boundary
-    """
-    if stage == 1 or (stage == 2 and epoch < stage2_switch):
-        n_lhs = int(N * 0.8)
-        n_bnd = N - n_lhs
-        t1, x1, y1 = lhs_points(n_lhs)
-        t2, x2, y2 = boundary_points(n_bnd)
-        t = np.vstack([t1, t2])
-        x = np.vstack([x1, x2])
-        y = np.vstack([y1, y2])
-        return t.astype(np.float64), x.astype(np.float64), y.astype(np.float64)
-
-    active = np.where(alpha_vals > 1e-3)[0] if alpha_vals is not None else np.array([])
-
-    if stage == 2:
-        n_dmg = int(N * 0.6)
-        n_glo = int(N * 0.3)
-        n_bnd = N - n_dmg - n_glo
-    else:  # stage 3
-        n_dmg = int(N * 0.8)
-        n_glo = int(N * 0.15)
-        n_bnd = N - n_dmg - n_glo
-
-    t_glo = np.random.uniform(0., 1., (n_glo, 1)).astype(np.float64)
-    x_glo = np.random.uniform(0., 1., (n_glo, 1)).astype(np.float64)
-    y_glo = np.random.uniform(0., 1., (n_glo, 1)).astype(np.float64)
-    t_bnd, x_bnd, y_bnd = boundary_points(n_bnd)
-
-    if len(active) == 0:
-        t_dmg, x_dmg, y_dmg = lhs_points(n_dmg)
-    else:
-        centres = [(x_vals[i], y_vals[i]) for i in active]
-        radii   = [r_vals[i] for i in active]
-        weights = alpha_vals[active]
-        if stage == 3:
-            t_dmg, x_dmg, y_dmg = damage_focused_points_hires(n_dmg, centres, radii, weights)
+def boundary_points(n: int, seed=None):
+    """Sample exactly ``n`` points, balanced over the four spatial edges."""
+    if n < 0:
+        raise ValueError("n must be non-negative")
+    rng = _rng(seed)
+    counts = np.full(4, n // 4, dtype=int)
+    counts[: n % 4] += 1
+    blocks = []
+    for edge, count in enumerate(counts):
+        block = rng.uniform(0.0, 1.0, (count, 3))
+        if edge < 2:
+            block[:, 1] = float(edge)
         else:
-            t_dmg, x_dmg, y_dmg = damage_focused_points(n_dmg, centres, radii, weights)
-
-    t = np.vstack([t_glo, t_bnd, t_dmg])
-    x = np.vstack([x_glo, x_bnd, x_dmg])
-    y = np.vstack([y_glo, y_bnd, y_dmg])
-    return t.astype(np.float64), x.astype(np.float64), y.astype(np.float64)
-
-
-def to_tensor(arr, device, dtype=torch.float64):
-    return torch.tensor(arr, dtype=dtype, device=device)
+            block[:, 2] = float(edge - 2)
+        blocks.append(block)
+    sample = np.vstack(blocks) if blocks else np.empty((0, 3))
+    rng.shuffle(sample)
+    return tuple(sample[:, i:i + 1].astype(np.float64) for i in range(3))
 
 
-# ---------------------------------------------------------------------------
-# Data loading and uniform-grid sub-sampling
-# ---------------------------------------------------------------------------
+def _focused_points(n, centres, radii, weights, rng, high_resolution=False):
+    if n == 0:
+        return lhs_points(0)
+    centres = np.asarray(centres, dtype=float)
+    radii = np.asarray(radii, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if centres.ndim != 2 or centres.shape[1] != 2 or len(centres) == 0:
+        raise ValueError("centres must have shape (K, 2)")
+    if len(radii) != len(centres) or len(weights) != len(centres):
+        raise ValueError("centres, radii, and weights must have equal lengths")
+    probabilities = np.clip(weights, 0.0, None)
+    probabilities = (probabilities / probabilities.sum() if probabilities.sum()
+                     else np.full(len(weights), 1 / len(weights)))
+    sites = rng.choice(len(centres), size=n, p=probabilities)
+    x = np.empty(n); y = np.empty(n)
+    for site in range(len(centres)):
+        idx = np.flatnonzero(sites == site)
+        if not len(idx):
+            continue
+        cx, cy = centres[site]
+        radius = max(float(radii[site]), np.finfo(float).eps)
+        if high_resolution:
+            inside = rng.random(len(idx)) < 0.7
+            radial = radius * np.sqrt(rng.random(len(idx)))
+            radial[~inside] = np.abs(rng.normal(radius, max(0.25 * radius, 0.005), (~inside).sum()))
+            angle = rng.uniform(0.0, 2.0 * np.pi, len(idx))
+            x[idx] = cx + radial * np.cos(angle)
+            y[idx] = cy + radial * np.sin(angle)
+        else:
+            sigma = max(2.0 * radius, 0.025)
+            x[idx] = rng.normal(cx, sigma, len(idx))
+            y[idx] = rng.normal(cy, sigma, len(idx))
+    sample = np.column_stack([rng.uniform(0.0, 1.0, n),
+                              np.clip(x, 0.0, 1.0), np.clip(y, 0.0, 1.0)])
+    return tuple(sample[:, i:i + 1].astype(np.float64) for i in range(3))
 
-def load_csv_folder(folder):
-    import os
+
+def generate_pde_points(n: int, stage=1, epoch=0, alpha_vals=None,
+                        x_vals=None, y_vals=None, r_vals=None,
+                        stage2_switch=2000, seed=None):
+    """Generate exactly ``n`` collocation points for the requested stage."""
+    rng = _rng(seed)
+    if stage not in (1, 2, 3):
+        raise ValueError("stage must be 1, 2, or 3")
+    if stage == 1 or (stage == 2 and epoch < stage2_switch):
+        n_global = int(round(0.8 * n)); n_boundary = n - n_global; n_damage = 0
+    elif stage == 2:
+        n_damage = int(round(0.6 * n)); n_global = int(round(0.3 * n)); n_boundary = n - n_damage - n_global
+    else:
+        n_damage = int(round(0.8 * n)); n_global = int(round(0.15 * n)); n_boundary = n - n_damage - n_global
+    blocks = [lhs_points(n_global, seed=rng), boundary_points(n_boundary, seed=rng)]
+    if n_damage:
+        alpha = np.asarray(alpha_vals if alpha_vals is not None else [], dtype=float)
+        active = np.flatnonzero(alpha > 1e-3)
+        if active.size:
+            centres = np.column_stack([np.asarray(x_vals)[active], np.asarray(y_vals)[active]])
+            focused = _focused_points(n_damage, centres, np.asarray(r_vals)[active],
+                                       alpha[active], rng, stage == 3)
+        else:
+            focused = lhs_points(n_damage, seed=rng)
+        blocks.append(focused)
+    return tuple(np.vstack([block[i] for block in blocks]) for i in range(3))
+
+
+def adaptive_points(n, stage, epoch, x_vals, y_vals, r_vals, alpha_vals,
+                    early_phase=2000, seed=None):
+    """Backward-compatible wrapper used by :class:`PINN`."""
+    return generate_pde_points(n, stage, epoch, alpha_vals, x_vals, y_vals,
+                               r_vals, early_phase, seed)
+
+
+def load_csv_folder(folder) -> pd.DataFrame:
+    """Load sorted CSV files, rejecting malformed or non-finite observations."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Data directory does not exist: {folder}")
+    files = sorted(folder.glob("*.csv"))
+    if not files:
+        raise FileNotFoundError(f"No CSV files found in {folder}")
     frames = []
-    for fname in os.listdir(folder):
-        if fname.endswith('.csv'):
-            try:
-                frames.append(pd.read_csv(os.path.join(folder, fname)))
-            except Exception as e:
-                print(f"Warning: skipped {fname}: {e}")
-    if not frames:
-        raise RuntimeError(f"No CSV files found in {folder}")
-    return pd.concat(frames, ignore_index=True)
+    for path in files:
+        frame = pd.read_csv(path)
+        missing = set(REQUIRED_COLUMNS) - set(frame.columns)
+        if missing:
+            raise ValueError(f"{path} is missing columns: {sorted(missing)}")
+        frame = frame.loc[:, REQUIRED_COLUMNS].apply(pd.to_numeric, errors="raise")
+        if not np.isfinite(frame.to_numpy()).all():
+            raise ValueError(f"{path} contains NaN or infinite values")
+        frame["source_file"] = path.name
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True).sort_values(
+        ["x", "y", "t"], kind="stable").reset_index(drop=True)
 
 
 def uniform_grid_sample(df, grid_size=15, num_time_points=80, tol=0.01):
-    """
-    Sub-sample df onto a regular grid_size × grid_size spatial grid,
-    keeping num_time_points per location.
-    """
+    """Select nearest unique sensors on a regular target grid and sample time."""
     if df.empty:
-        raise ValueError("Input dataframe is empty.")
-
-    x_pts = np.linspace(df['x'].min(), df['x'].max(), grid_size)
-    y_pts = np.linspace(df['y'].min(), df['y'].max(), grid_size)
-
+        raise ValueError("Input dataframe is empty")
+    if grid_size < 2 or num_time_points < 1 or tol <= 0:
+        raise ValueError("grid_size >= 2, num_time_points >= 1, and tol > 0 are required")
+    sensors = df[["x", "y"]].drop_duplicates().to_numpy()
+    targets = np.array(np.meshgrid(np.linspace(df.x.min(), df.x.max(), grid_size),
+                                   np.linspace(df.y.min(), df.y.max(), grid_size))).reshape(2, -1).T
+    selected = set()
+    for target in targets:
+        distances = np.linalg.norm(sensors - target, axis=1)
+        nearest = int(np.argmin(distances))
+        if distances[nearest] <= tol:
+            selected.add(tuple(sensors[nearest]))
+    if not selected:
+        raise RuntimeError("No spatial sensor matched the requested grid within tolerance")
     pieces = []
-    found = 0
-    for xv in x_pts:
-        for yv in y_pts:
-            mask = (np.abs(df['x'] - xv) < tol) & (np.abs(df['y'] - yv) < tol)
-            sub = df[mask]
-            if sub.empty:
-                continue
-            # use the first matched coordinate to avoid floating-point spread
-            mx, my = sub.iloc[0]['x'], sub.iloc[0]['y']
-            sub = df[(np.abs(df['x'] - mx) < tol) & (np.abs(df['y'] - my) < tol)]
-            if len(sub) >= num_time_points:
-                idx = np.linspace(0, len(sub) - 1, num_time_points, dtype=int)
-                sub = sub.iloc[idx]
-            pieces.append(sub)
-            found += 1
+    for x, y in sorted(selected):
+        rows = df[(df.x == x) & (df.y == y)].sort_values("t", kind="stable")
+        idx = np.linspace(0, len(rows) - 1, min(num_time_points, len(rows)), dtype=int)
+        pieces.append(rows.iloc[np.unique(idx)])
+    return pd.concat(pieces, ignore_index=True)
 
-    if found == 0:
-        raise RuntimeError("No spatial grid points matched within tolerance.")
 
-    result = pd.concat(pieces, ignore_index=True)
-    n_spatial = result[['x', 'y']].drop_duplicates().__len__()
-    print(f"Grid sampling: {found}/{grid_size**2} locations matched, "
-          f"{n_spatial} unique, {len(result)} total points.")
-    return result
+def split_by_sensor(df, val_fraction=0.15, test_fraction=0.15, seed=1234):
+    """Split whole spatial sensor groups to prevent temporal leakage."""
+    if val_fraction < 0 or test_fraction < 0 or val_fraction + test_fraction >= 1:
+        raise ValueError("fractions must be non-negative and sum to less than one")
+    sensors = df[["x", "y"]].drop_duplicates().to_numpy()
+    if len(sensors) < 3:
+        raise ValueError("At least three unique sensor locations are required for splitting")
+    order = _rng(seed).permutation(len(sensors))
+    n_test = max(1, int(round(test_fraction * len(sensors))))
+    n_val = max(1, int(round(val_fraction * len(sensors))))
+    if n_test + n_val >= len(sensors):
+        n_test = n_val = 1
+    labels = {}
+    for i, idx in enumerate(order):
+        labels[tuple(sensors[idx])] = ("test" if i < n_test else
+                                      "validation" if i < n_test + n_val else "train")
+    groups = df.apply(lambda row: labels[(row.x, row.y)], axis=1)
+    return tuple(df.loc[groups == name].reset_index(drop=True)
+                 for name in ("train", "validation", "test"))

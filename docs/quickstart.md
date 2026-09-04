@@ -1,52 +1,35 @@
-# Quick-Start Guide
+# Quick start
 
-## 1. Minimum working example
+1. Install and verify the environment:
 
-After installing dependencies and placing your CSV data in `data/healthy/`
-and `data/damaged/`, run:
+   ```bash
+   pip install -e ".[test]"
+   pytest
+   ```
 
-```bash
-cd src
-python main.py
-```
+2. Put finite numeric `t,x,y,u` CSV data in `data/healthy` and `data/damaged`.
 
-Training on a single RTX 4060 (8 GB) takes approximately:
+3. Confirm all physical constants and the actual edge condition in
+   `src/config.py`. In particular, verify that `DELTA_SIGMA` has units of
+   kg/m2 and is experimentally defensible.
 
-| Stage | Optimiser | Epochs | Typical time |
-|-------|-----------|--------|-------------|
-| 1 | Adam | 9 000 | ~40 min |
-| 1 | L-BFGS | 1 000 | ~15 min |
-| 2 | Adam | 1 000 | ~10 min |
-| 3 | Adam | 1 000 | ~10 min |
+4. Exercise the complete pipeline cheaply:
 
-## 2. Resuming from a checkpoint
+   ```bash
+   python -m src.main --smoke-test --coordinate-mode physical
+   ```
 
-To skip Stage 1 and start from a saved checkpoint:
+5. Run a recorded experiment:
 
-```python
-# In main.py, replace the Stage-1 block with:
-pinn1 = build_pinn(cfg, t_h, x_h, y_h, u_h, t_pde1, x_pde1, y_pde1, device)
-pinn1.load_model("stage1_model.pth")
-```
+   ```bash
+   python -m src.main --coordinate-mode physical \
+     --output-dir results/run-1234 --seed 1234
+   ```
 
-## 3. Changing the number of damage sites
+The output directory contains `data_split.json`, `metrics.json`, three
+checkpoints, `damage_parameters.npz`, and figures. Metrics named `test` are
+computed only after training; use `validation` for model selection.
 
-Edit `K_MAX` in `src/config.py` and update `INIT_POSITIONS`, `INIT_RADII_MM`,
-and `INIT_ALPHA` to match the new count.
-
-## 4. Using a different plate material
-
-Update the physical constants block in `src/config.py`:
-
-```python
-E          = 200e9    # steel: 200 GPa
-NU         = 0.30
-RHO0       = 7850.0   # kg/m3
-H_PLATE    = 0.002    # 2 mm
-```
-
-## 5. Output files
-
-All plots and model checkpoints are written to the working directory
-(wherever `main.py` is run from). Redirect them by editing the `save_path`
-arguments in the `main()` function.
+For normalized input files, pass `--coordinate-mode normalized`. The program
+rejects out-of-range coordinates rather than silently mixing physical and
+dimensionless units.

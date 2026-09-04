@@ -1,239 +1,153 @@
-"""
-main.py  —  Kirchhoff-Love plate damage identification via PINN
-Three-stage training:
-  Stage 1 : fit healthy-plate network  (Adam + L-BFGS)
-  Stage 2 : joint network + damage optimisation  (Adam, damped network lr)
-  Stage 3 : damage-parameter refinement  (Adam)
-"""
+"""Command-line training and held-out evaluation entry point."""
 
-import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+from __future__ import annotations
 
+import argparse
+import json
 import sys
 import time
-import glob
+from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
-import matplotlib
-matplotlib.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
-matplotlib.rcParams['axes.unicode_minus'] = False
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, current_dir)
-
-import config as C
-from pinn import PINN
-from sampler import lhs_points
 
 try:
-    from plot import (plot_loss_curve, plot_damage_map,
-                      plot_damage_parameter_evolution, plot_damage_position_trajectory,
-                      plot_total_loss_curve, plot_lbfgs_training,
-                      plot_stage_total_loss, plot_pinn_gradient_flow,
-                      plot_damage_spatial_gradient_field_flow)
+    from . import config as C
+    from .pinn import PINN
+    from .plot import plot_damage_map, plot_history
+    from .sampling import (generate_pde_points, load_csv_folder,
+                           split_by_sensor, uniform_grid_sample)
 except ImportError:
-    def _noop(*a, **kw): pass
-    (plot_loss_curve, plot_damage_map, plot_damage_parameter_evolution,
-     plot_damage_position_trajectory, plot_total_loss_curve,
-     plot_lbfgs_training, plot_stage_total_loss, plot_pinn_gradient_flow,
-     plot_damage_spatial_gradient_field_flow) = (_noop,)*9
+    import config as C
+    from pinn import PINN
+    from plot import plot_damage_map, plot_history
+    from sampling import (generate_pde_points, load_csv_folder,
+                          split_by_sensor, uniform_grid_sample)
 
 
-# ── Data utilities ────────────────────────────────────────────────────────────
-
-def load_csv_folder(folder):
-    frames = []
-    for f in os.listdir(folder):
-        if f.endswith('.csv'):
-            try:
-                frames.append(pd.read_csv(os.path.join(folder, f)))
-            except Exception as e:
-                print(f"  Warning: could not read {f}: {e}")
-    if not frames:
-        raise RuntimeError(f"No CSV files found in {folder}")
-    return pd.concat(frames, ignore_index=True)
-
-
-def uniform_grid_sample(df, grid_size=C.GRID_SIZE,
-                         n_time=C.N_TIME_POINTS, tol=C.SAMPLING_TOL):
-    """
-    Down-sample df to a uniform (grid_size × grid_size) spatial grid,
-    taking up to n_time evenly spaced temporal snapshots per location.
-    """
-    xs = np.linspace(df['x'].min(), df['x'].max(), grid_size)
-    ys = np.linspace(df['y'].min(), df['y'].max(), grid_size)
-    Xg, Yg = np.meshgrid(xs, ys)
-    grid = np.column_stack([Xg.ravel(), Yg.ravel()])
-
-    parts, found = [], 0
-    for xv, yv in grid:
-        match = df[(np.abs(df['x'] - xv) < tol) & (np.abs(df['y'] - yv) < tol)]
-        if len(match) == 0: continue
-        xm, ym = match.iloc[0]['x'], match.iloc[0]['y']
-        rows = df[(np.abs(df['x'] - xm) < tol) & (np.abs(df['y'] - ym) < tol)]
-        if len(rows) >= n_time:
-            idx = np.linspace(0, len(rows)-1, n_time, dtype=int)
-            rows = rows.iloc[idx]
-        parts.append(rows);  found += 1
-
-    if found == 0:
-        print("Warning: no spatial grid matches — falling back to random sample.")
-        return df.sample(min(1000, len(df)), random_state=C.R_SEED)
-
-    result = pd.concat(parts, ignore_index=True)
-    print(f"  Grid sample: {found}/{len(grid)} locations, {len(result)} total points")
-    return result
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--healthy-data", type=Path, default=Path(C.DATA_HEALTHY))
+    parser.add_argument("--damaged-data", type=Path, default=Path(C.DATA_DAMAGE))
+    parser.add_argument("--output-dir", type=Path, default=Path("results"))
+    parser.add_argument("--coordinate-mode", choices=("normalized", "physical"),
+                        default="normalized",
+                        help="Units of t,x,y in CSV files; physical means seconds/metres.")
+    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
+    parser.add_argument("--seed", type=int, default=C.R_SEED)
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="Run one Adam epoch per stage and skip L-BFGS.")
+    return parser.parse_args(argv)
 
 
-def df_to_tensors(df, device):
-    def _t(col): return torch.tensor(df[col].values.reshape(-1,1), dtype=torch.float64)
-    return _t('t').to(device), _t('x').to(device), _t('y').to(device), _t('u').to(device)
+def normalize_coordinates(frame: pd.DataFrame, mode: str) -> pd.DataFrame:
+    frame = frame.copy()
+    if mode == "physical":
+        frame["t"] /= C.T_PHYSICAL
+        frame["x"] /= C.X_PHYSICAL
+        frame["y"] /= C.Y_PHYSICAL
+    for column in ("t", "x", "y"):
+        minimum, maximum = frame[column].min(), frame[column].max()
+        if minimum < -1e-10 or maximum > 1.0 + 1e-10:
+            raise ValueError(
+                f"{column} range [{minimum:.6g}, {maximum:.6g}] is outside [0,1]. "
+                "Choose the correct --coordinate-mode and verify physical constants.")
+    return frame
 
 
-def pde_tensors(N, device, batch=C.PDE_LHS_BATCH):
-    t, x, y = lhs_points(N, batch)
-    def _t(a): return torch.tensor(a, dtype=torch.float64).to(device)
-    return _t(t), _t(x), _t(y)
+def prepare_data(path: Path, mode: str):
+    frame = normalize_coordinates(load_csv_folder(path), mode)
+    return uniform_grid_sample(frame, C.GRID_SIZE, C.N_TIME_POINTS, C.SAMPLING_TOL)
 
 
-def batch_size_for(n_data, stage):
-    if   stage == 1: return 2048 if n_data >= 20000 else (1024 if n_data >= 10000 else 512)
-    elif stage == 2: return 1024 if n_data >= 20000 else (512  if n_data >= 10000 else 256)
-    else:            return 512  if n_data >= 20000 else (256  if n_data >= 10000 else 128)
+def tensors(frame, device):
+    return tuple(torch.tensor(frame[col].to_numpy().reshape(-1, 1),
+                              dtype=torch.float64, device=device)
+                 for col in ("t", "x", "y", "u"))
 
 
-def gpu_memory_report():
-    if torch.cuda.is_available():
-        alloc = torch.cuda.memory_allocated() / 1024**3
-        peak  = torch.cuda.max_memory_allocated() / 1024**3
-        print(f"  GPU: allocated {alloc:.2f} GB, peak {peak:.2f} GB")
+def build_model(frame, device, stage_seed):
+    data = tensors(frame, device)
+    pde = generate_pde_points(C.N_PDE, seed=stage_seed)
+    return PINN(*data, *pde, device=device)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def split_manifest(train, validation, test):
+    def describe(frame):
+        return {"observations": len(frame),
+                "sensors": len(frame[["x", "y"]].drop_duplicates()),
+                "time_min": float(frame.t.min()), "time_max": float(frame.t.max())}
+    return {name: describe(frame) for name, frame in
+            (("train", train), ("validation", validation), ("test", test))}
 
-def main():
-    print("=" * 70)
-    print("Kirchhoff-Love Plate Damage Identification — PINN (PyTorch)")
-    print("=" * 70)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}" +
-          (f"  ({torch.cuda.get_device_name(0)})" if device.type == 'cuda' else ""))
+def main(argv=None):
+    args = parse_args(argv)
+    C.R_SEED = args.seed
+    if args.smoke_test:
+        C.N_PDE, C.N_BC, C.F_MNTR = 128, 32, 1
+    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available()
+                          else "cpu" if args.device == "auto" else args.device)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    started = time.time()
 
-    # ── Stage 1: healthy network ──────────────────────────────────────────────
-    print("\n── Stage 1: healthy plate ──")
-    df_h = load_csv_folder(C.DATA_HEALTHY)
-    df_h = uniform_grid_sample(df_h)
-    t_h, x_h, y_h, u_h = df_to_tensors(df_h, device)
-    t_p1, x_p1, y_p1   = pde_tensors(C.N_PDE, device)
+    healthy = prepare_data(args.healthy_data, args.coordinate_mode)
+    damaged = prepare_data(args.damaged_data, args.coordinate_mode)
+    h_train, h_val, h_test = split_by_sensor(healthy, C.VAL_FRACTION,
+                                             C.TEST_FRACTION, args.seed)
+    d_train, d_val, d_test = split_by_sensor(damaged, C.VAL_FRACTION,
+                                             C.TEST_FRACTION, args.seed)
+    manifest = {"healthy": split_manifest(h_train, h_val, h_test),
+                "damaged": split_manifest(d_train, d_val, d_test)}
+    (args.output_dir / "data_split.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8")
 
-    m1 = PINN(t_h, x_h, y_h, u_h, t_p1, x_p1, y_p1, device=device)
-    m1.set_stage(1)
-    m1.w_data = C.W_DATA_S1
+    adam1, lbfgs, adam2, adam3 = ((1, 0, 1, 1) if args.smoke_test else
+                                  (C.S1_ADAM_EPOCHS, C.S1_LBFGS_EPOCHS,
+                                   C.S2_EPOCHS, C.S3_EPOCHS))
 
-    t0 = time.time()
-    m1.train(C.S1_ADAM_EPOCHS, batch_size_for(len(t_h), 1), stage=1, start_epoch=0)
-    lbfgs_loss = m1.train_lbfgs(C.S1_LBFGS_EPOCHS)
-    print(f"Stage 1 done in {time.time()-t0:.1f}s | L-BFGS final {lbfgs_loss:.3e}")
-    gpu_memory_report()
+    model1 = build_model(h_train, device, args.seed)
+    model1.w_data = C.W_DATA_S1
+    model1.train(adam1, min(512, len(h_train)), stage=1,
+                 validation_data=tensors(h_val, device))
+    if lbfgs:
+        model1.train_lbfgs(lbfgs, validation_data=tensors(h_val, device))
+    model1.save_model(args.output_dir / "stage1.pt")
 
-    plot_lbfgs_training(m1, 1)
-    plot_stage_total_loss(m1, 1)
-    m1.save_model("stage1_model.pth")
+    model2 = build_model(d_train, device, args.seed + 1)
+    checkpoint = torch.load(args.output_dir / "stage1.pt", map_location=device,
+                            weights_only=False)
+    model2.net.load_state_dict(checkpoint["net"])
+    model2.w_data, model2.w_reg_r, model2.w_reg_g = (
+        C.W_DATA_S2, C.W_REG_R_S2, C.W_REG_G_S2)
+    model2.train(adam2, min(256, len(d_train)), stage=2,
+                 validation_data=tensors(d_val, device))
+    model2.save_model(args.output_dir / "stage2.pt")
 
-    # ── Stage 2: joint optimisation ───────────────────────────────────────────
-    print("\n── Stage 2: joint optimisation ──")
-    df_d = load_csv_folder(C.DATA_DAMAGE)
-    df_d = uniform_grid_sample(df_d)
-    t_d, x_d, y_d, u_d = df_to_tensors(df_d, device)
-    t_p2, x_p2, y_p2   = pde_tensors(C.N_PDE, device)
+    model3 = build_model(d_train, device, args.seed + 2)
+    model3.load_model(args.output_dir / "stage2.pt")
+    model3.w_data, model3.w_reg_r, model3.w_reg_g = (
+        C.W_DATA_S3, C.W_REG_R_S3, C.W_REG_G_S3)
+    model3.train(adam3, min(256, len(d_train)), stage=3,
+                 start_epoch=adam2, validation_data=tensors(d_val, device))
+    model3.save_model(args.output_dir / "stage3.pt")
+    model3.save_damage_params(args.output_dir / "damage_parameters.npz")
 
-    m2 = PINN(t_d, x_d, y_d, u_d, t_p2, x_p2, y_p2, device=device)
-    ck1 = torch.load("stage1_model.pth", map_location=device)
-    m2.net.load_state_dict(ck1['net'])
-
-    m2.init_damage_params()
-    m2.set_stage(2)
-    m2.w_data   = C.W_DATA_S2
-    m2.w_pde    = 100.0
-    m2.w_reg_r  = C.W_REG_R_S2
-    m2.w_reg_g  = C.W_REG_G_S2
-
-    plot_damage_map(m2, "Stage 2 Initial", "(Before Training)", stage=2,
-                    save_path="initial_damage.png")
-
-    t0 = time.time()
-    m2.train(C.S2_EPOCHS, batch_size_for(len(t_d), 2),
-             stage=2, start_epoch=0, joint_training=True)
-    print(f"Stage 2 done in {time.time()-t0:.1f}s")
-    gpu_memory_report()
-
-    plot_stage_total_loss(m2, 2)
-    plot_pinn_gradient_flow(m2, stage=2, save_path="stage2_grad_flow.png")
-    plot_damage_spatial_gradient_field_flow(m2, stage=2,
-                                            save_path="stage2_dmg_grad_field.png")
-    m2.save_model("stage2_model.pth")
-    m2.save_damage_params("damage_params_stage2.npz")
-
-    # ── Stage 3: refinement ───────────────────────────────────────────────────
-    print("\n── Stage 3: refinement ──")
-    m3 = PINN(t_d, x_d, y_d, u_d, t_p2, x_p2, y_p2, device=device)
-    m3.load_model("stage2_model.pth")
-    m3.set_stage(3)
-    m3.w_data  = C.W_DATA_S3
-    m3.w_pde   = 100.0
-    m3.w_reg_r = C.W_REG_R_S3
-    m3.w_reg_g = C.W_REG_G_S3
-
-    start_s3 = (m3.damage_ep_hist[-1] if m3.damage_ep_hist
-                else (m3.ep_log[-1] if m3.ep_log else C.S2_EPOCHS))
-
-    t0 = time.time()
-    m3.train(C.S3_EPOCHS, batch_size_for(len(t_d), 3),
-             stage=3, start_epoch=start_s3)
-    print(f"Stage 3 done in {time.time()-t0:.1f}s")
-    gpu_memory_report()
-
-    plot_stage_total_loss(m3, 3)
-    plot_pinn_gradient_flow(m3, stage=3, save_path="stage3_grad_flow.png")
-    plot_total_loss_curve(m1, m2, m3)
-    plot_damage_parameter_evolution(m3, start_epoch_stage2=0)
-    plot_damage_position_trajectory(m3, start_epoch_stage2=0,
-                                    save_path="damage_trajectory.png")
-    plot_damage_map(m3, "Final", f"(Stage 3)", stage=3,
-                    save_path="damage_map_final.png")
-    plot_damage_spatial_gradient_field_flow(m3, stage=3,
-                                            save_path="stage3_dmg_grad_field.png")
-    m3.save_model("stage3_final_model.pth")
-
-    # ── Evaluation ────────────────────────────────────────────────────────────
-    res = m3.evaluate()
-    print("\n" + "=" * 70)
-    print("FINAL RESULTS")
-    print("=" * 70)
-    print(f"  RMSE (data)          = {res['rmse_data']:.3e}")
-    print(f"  Main damage α        = {res['main_alpha']:.4f}")
-    print(f"  Main damage position = ({res['main_x']:.4f}, {res['main_y']:.4f})  [normalised]")
-    print(f"  Main damage radius   = {res['main_r_mm']:.2f} mm")
-    if 'final_total_loss' in res:
-        print(f"  L_total (final)      = {res['final_total_loss']:.3e}")
-        print(f"  L_pde   (final)      = {res['final_pde_loss']:.3e}")
-        print(f"  L_data  (final)      = {res['final_data_loss']:.3e}")
-    print("=" * 70)
-
-    # Optional: generate evolution GIF
-    try:
-        import imageio.v3 as iio
-        pngs = sorted(glob.glob("./damage_evolution/damage_*.png"))
-        if pngs:
-            frames = [iio.imread(p) for p in pngs]
-            iio.imwrite("./damage_evolution/evolution.gif", frames, fps=5, loop=0)
-            print("GIF saved → ./damage_evolution/evolution.gif")
-    except Exception:
-        pass
+    metrics = {"schema_version": C.SCHEMA_VERSION,
+               "device": str(device), "seed": args.seed,
+               "coordinate_mode": args.coordinate_mode,
+               "elapsed_seconds": time.time() - started,
+               "healthy": {"validation": model1.evaluate(tensors(h_val, device)),
+                           "test": model1.evaluate(tensors(h_test, device))},
+               "damaged": {"validation": model3.evaluate(tensors(d_val, device)),
+                           "test": model3.evaluate(tensors(d_test, device))}}
+    (args.output_dir / "metrics.json").write_text(
+        json.dumps(metrics, indent=2), encoding="utf-8")
+    plot_history(model3, args.output_dir / "training_history.png")
+    plot_damage_map(model3, args.output_dir / "damage_map.png")
+    print(json.dumps(metrics["damaged"]["test"], indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
