@@ -12,6 +12,8 @@ class DNN(nn.Module):
     def __init__(self, layers, w_init="xavier", b_init="zeros",
                  activation="tanh", laaf=False, dtype=torch.float64):
         super().__init__()
+        if activation.lower() != "tanh":
+            raise ValueError("Fourth-order plate derivatives require this model's tanh activation.")
         self.laaf = laaf
         self.dtype = dtype
 

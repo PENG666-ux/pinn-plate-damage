@@ -1,238 +1,213 @@
-"""
-main.py  —  Kirchhoff-Love plate damage identification via PINN
-Three-stage training:
-  Stage 1 : fit healthy-plate network  (Adam + L-BFGS)
-  Stage 2 : joint network + damage optimisation  (Adam, damped network lr)
-  Stage 3 : damage-parameter refinement  (Adam)
-"""
+"""Run the healthy baseline, optional transfer, and staged damage inversion."""
 
-import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-import sys
+import argparse
+import json
+from pathlib import Path
 import time
-import glob
 
 import numpy as np
-import pandas as pd
 import torch
-import matplotlib
-matplotlib.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
-matplotlib.rcParams['axes.unicode_minus'] = False
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, current_dir)
-
-import config as C
-from pinn import PINN
-from sampler import lhs_points
 
 try:
-    from plot import (plot_loss_curve, plot_damage_map,
-                      plot_damage_parameter_evolution, plot_damage_position_trajectory,
-                      plot_total_loss_curve, plot_lbfgs_training,
-                      plot_stage_total_loss, plot_pinn_gradient_flow,
-                      plot_damage_spatial_gradient_field_flow)
-except ImportError:
-    def _noop(*a, **kw): pass
-    (plot_loss_curve, plot_damage_map, plot_damage_parameter_evolution,
-     plot_damage_position_trajectory, plot_total_loss_curve,
-     plot_lbfgs_training, plot_stage_total_loss, plot_pinn_gradient_flow,
-     plot_damage_spatial_gradient_field_flow) = (_noop,)*9
+    from . import config as C
+    from .sampling import generate_pde_points, load_csv_folder, uniform_grid_sample
+except ImportError:  # Support both python -m src.main and python src/main.py.
+    import config as C
+    from sampling import generate_pde_points, load_csv_folder, uniform_grid_sample
 
 
-# ── Data utilities ────────────────────────────────────────────────────────────
+def parse_args(argv=None):
+    """Parse reproducible input and output locations without changing source."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--healthy", type=Path, default=Path(C.DATA_HEALTHY))
+    parser.add_argument("--damaged", type=Path, default=Path(C.DATA_DAMAGE))
+    parser.add_argument(
+        "--pretrain", type=Path,
+        help="Optional healthy simulation CSV folder before healthy-data fine-tuning.",
+    )
+    parser.add_argument(
+        "--output", type=Path, default=Path(__file__).resolve().parents[1] / "results"
+    )
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--seed", type=int, default=C.R_SEED)
+    parser.add_argument(
+        "--smoke", action="store_true",
+        help="Use a tiny CPU-friendly schedule; this does not assess inverse accuracy.",
+    )
+    parser.add_argument("--plots", action="store_true", help="Save loss and estimate plots.")
+    return parser.parse_args(argv)
 
-def load_csv_folder(folder):
-    frames = []
-    for f in os.listdir(folder):
-        if f.endswith('.csv'):
-            try:
-                frames.append(pd.read_csv(os.path.join(folder, f)))
-            except Exception as e:
-                print(f"  Warning: could not read {f}: {e}")
-    if not frames:
-        raise RuntimeError(f"No CSV files found in {folder}")
-    return pd.concat(frames, ignore_index=True)
 
-
-def uniform_grid_sample(df, grid_size=C.GRID_SIZE,
-                         n_time=C.N_TIME_POINTS, tol=C.SAMPLING_TOL):
-    """
-    Down-sample df to a uniform (grid_size × grid_size) spatial grid,
-    taking up to n_time evenly spaced temporal snapshots per location.
-    """
-    xs = np.linspace(df['x'].min(), df['x'].max(), grid_size)
-    ys = np.linspace(df['y'].min(), df['y'].max(), grid_size)
-    Xg, Yg = np.meshgrid(xs, ys)
-    grid = np.column_stack([Xg.ravel(), Yg.ravel()])
-
-    parts, found = [], 0
-    for xv, yv in grid:
-        match = df[(np.abs(df['x'] - xv) < tol) & (np.abs(df['y'] - yv) < tol)]
-        if len(match) == 0: continue
-        xm, ym = match.iloc[0]['x'], match.iloc[0]['y']
-        rows = df[(np.abs(df['x'] - xm) < tol) & (np.abs(df['y'] - ym) < tol)]
-        if len(rows) >= n_time:
-            idx = np.linspace(0, len(rows)-1, n_time, dtype=int)
-            rows = rows.iloc[idx]
-        parts.append(rows);  found += 1
-
-    if found == 0:
-        print("Warning: no spatial grid matches — falling back to random sample.")
-        return df.sample(min(1000, len(df)), random_state=C.R_SEED)
-
-    result = pd.concat(parts, ignore_index=True)
-    print(f"  Grid sample: {found}/{len(grid)} locations, {len(result)} total points")
-    return result
+def apply_runtime_config(args):
+    """Apply explicit overrides before constructing any PINN instances."""
+    C.R_SEED = args.seed
+    C.DATA_HEALTHY = str(args.healthy.resolve())
+    C.DATA_DAMAGE = str(args.damaged.resolve())
+    # main owns optional final plots; old per-epoch plots are intentionally disabled.
+    C.ENABLE_PLOTS = False
+    if args.smoke:
+        overrides = dict(
+            WIDTH=8, DEPTH=2, N_PDE=12, PDE_LBFGS_SUBSET=12,
+            GRID_SIZE=3, N_TIME_POINTS=4, S1_ADAM_EPOCHS=1,
+            S1_LBFGS_EPOCHS=1, FINETUNE_EPOCHS=1,
+            S2_EPOCHS=2, S3_EPOCHS=1, S2_EARLY_PHASE=1,
+            ADAPTIVE_UPDATE_INTERVAL=1, F_MNTR=1,
+        )
+        for name, value in overrides.items():
+            setattr(C, name, value)
+        torch.set_num_threads(1)
+    np.random.seed(C.R_SEED)
+    torch.manual_seed(C.R_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(C.R_SEED)
 
 
 def df_to_tensors(df, device):
-    def _t(col): return torch.tensor(df[col].values.reshape(-1,1), dtype=torch.float64)
-    return _t('t').to(device), _t('x').to(device), _t('y').to(device), _t('u').to(device)
+    """Use float64 for all observations and fourth-order derivatives."""
+    return tuple(
+        torch.as_tensor(df[col].to_numpy().reshape(-1, 1),
+                        dtype=torch.float64, device=device)
+        for col in ("t", "x", "y", "u")
+    )
 
 
-def pde_tensors(N, device, batch=C.PDE_LHS_BATCH):
-    t, x, y = lhs_points(N, batch)
-    def _t(a): return torch.tensor(a, dtype=torch.float64).to(device)
-    return _t(t), _t(x), _t(y)
-
-
-def batch_size_for(n_data, stage):
-    if   stage == 1: return 2048 if n_data >= 20000 else (1024 if n_data >= 10000 else 512)
-    elif stage == 2: return 1024 if n_data >= 20000 else (512  if n_data >= 10000 else 256)
-    else:            return 512  if n_data >= 20000 else (256  if n_data >= 10000 else 128)
-
-
-def gpu_memory_report():
-    if torch.cuda.is_available():
-        alloc = torch.cuda.memory_allocated() / 1024**3
-        peak  = torch.cuda.max_memory_allocated() / 1024**3
-        print(f"  GPU: allocated {alloc:.2f} GB, peak {peak:.2f} GB")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def main():
-    print("=" * 70)
-    print("Kirchhoff-Love Plate Damage Identification — PINN (PyTorch)")
-    print("=" * 70)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}" +
-          (f"  ({torch.cuda.get_device_name(0)})" if device.type == 'cuda' else ""))
-
-    # ── Stage 1: healthy network ──────────────────────────────────────────────
-    print("\n── Stage 1: healthy plate ──")
-    df_h = load_csv_folder(C.DATA_HEALTHY)
-    df_h = uniform_grid_sample(df_h)
-    t_h, x_h, y_h, u_h = df_to_tensors(df_h, device)
-    t_p1, x_p1, y_p1   = pde_tensors(C.N_PDE, device)
-
-    m1 = PINN(t_h, x_h, y_h, u_h, t_p1, x_p1, y_p1, device=device)
-    m1.set_stage(1)
-    m1.w_data = C.W_DATA_S1
-
-    t0 = time.time()
-    m1.train(C.S1_ADAM_EPOCHS, batch_size_for(len(t_h), 1), stage=1, start_epoch=0)
-    lbfgs_loss = m1.train_lbfgs(C.S1_LBFGS_EPOCHS)
-    print(f"Stage 1 done in {time.time()-t0:.1f}s | L-BFGS final {lbfgs_loss:.3e}")
-    gpu_memory_report()
-
-    plot_lbfgs_training(m1, 1)
-    plot_stage_total_loss(m1, 1)
-    m1.save_model("stage1_model.pth")
-
-    # ── Stage 2: joint optimisation ───────────────────────────────────────────
-    print("\n── Stage 2: joint optimisation ──")
-    df_d = load_csv_folder(C.DATA_DAMAGE)
-    df_d = uniform_grid_sample(df_d)
-    t_d, x_d, y_d, u_d = df_to_tensors(df_d, device)
-    t_p2, x_p2, y_p2   = pde_tensors(C.N_PDE, device)
-
-    m2 = PINN(t_d, x_d, y_d, u_d, t_p2, x_p2, y_p2, device=device)
-    ck1 = torch.load("stage1_model.pth", map_location=device)
-    m2.net.load_state_dict(ck1['net'])
-
-    m2.init_damage_params()
-    m2.set_stage(2)
-    m2.w_data   = C.W_DATA_S2
-    m2.w_pde    = 100.0
-    m2.w_reg_r  = C.W_REG_R_S2
-    m2.w_reg_g  = C.W_REG_G_S2
-
-    plot_damage_map(m2, "Stage 2 Initial", "(Before Training)", stage=2,
-                    save_path="initial_damage.png")
-
-    t0 = time.time()
-    m2.train(C.S2_EPOCHS, batch_size_for(len(t_d), 2),
-             stage=2, start_epoch=0, joint_training=True)
-    print(f"Stage 2 done in {time.time()-t0:.1f}s")
-    gpu_memory_report()
-
-    plot_stage_total_loss(m2, 2)
-    plot_pinn_gradient_flow(m2, stage=2, save_path="stage2_grad_flow.png")
-    plot_damage_spatial_gradient_field_flow(m2, stage=2,
-                                            save_path="stage2_dmg_grad_field.png")
-    m2.save_model("stage2_model.pth")
-    m2.save_damage_params("damage_params_stage2.npz")
-
-    # ── Stage 3: refinement ───────────────────────────────────────────────────
-    print("\n── Stage 3: refinement ──")
-    m3 = PINN(t_d, x_d, y_d, u_d, t_p2, x_p2, y_p2, device=device)
-    m3.load_model("stage2_model.pth")
-    m3.set_stage(3)
-    m3.w_data  = C.W_DATA_S3
-    m3.w_pde   = 100.0
-    m3.w_reg_r = C.W_REG_R_S3
-    m3.w_reg_g = C.W_REG_G_S3
-
-    start_s3 = (m3.damage_ep_hist[-1] if m3.damage_ep_hist
-                else (m3.ep_log[-1] if m3.ep_log else C.S2_EPOCHS))
-
-    t0 = time.time()
-    m3.train(C.S3_EPOCHS, batch_size_for(len(t_d), 3),
-             stage=3, start_epoch=start_s3)
-    print(f"Stage 3 done in {time.time()-t0:.1f}s")
-    gpu_memory_report()
-
-    plot_stage_total_loss(m3, 3)
-    plot_pinn_gradient_flow(m3, stage=3, save_path="stage3_grad_flow.png")
-    plot_total_loss_curve(m1, m2, m3)
-    plot_damage_parameter_evolution(m3, start_epoch_stage2=0)
-    plot_damage_position_trajectory(m3, start_epoch_stage2=0,
-                                    save_path="damage_trajectory.png")
-    plot_damage_map(m3, "Final", f"(Stage 3)", stage=3,
-                    save_path="damage_map_final.png")
-    plot_damage_spatial_gradient_field_flow(m3, stage=3,
-                                            save_path="stage3_dmg_grad_field.png")
-    m3.save_model("stage3_final_model.pth")
-
-    # ── Evaluation ────────────────────────────────────────────────────────────
-    res = m3.evaluate()
-    print("\n" + "=" * 70)
-    print("FINAL RESULTS")
-    print("=" * 70)
-    print(f"  RMSE (data)          = {res['rmse_data']:.3e}")
-    print(f"  Main damage α        = {res['main_alpha']:.4f}")
-    print(f"  Main damage position = ({res['main_x']:.4f}, {res['main_y']:.4f})  [normalised]")
-    print(f"  Main damage radius   = {res['main_r_mm']:.2f} mm")
-    if 'final_total_loss' in res:
-        print(f"  L_total (final)      = {res['final_total_loss']:.3e}")
-        print(f"  L_pde   (final)      = {res['final_pde_loss']:.3e}")
-        print(f"  L_data  (final)      = {res['final_data_loss']:.3e}")
-    print("=" * 70)
-
-    # Optional: generate evolution GIF
+def build_model(df, device):
+    """Build a PINN from data and the common collocation sampler."""
     try:
-        import imageio.v3 as iio
-        pngs = sorted(glob.glob("./damage_evolution/damage_*.png"))
-        if pngs:
-            frames = [iio.imread(p) for p in pngs]
-            iio.imwrite("./damage_evolution/evolution.gif", frames, fps=5, loop=0)
-            print("GIF saved → ./damage_evolution/evolution.gif")
-    except Exception:
-        pass
+        from .pinn import PINN
+    except ImportError:
+        from pinn import PINN
+    data = df_to_tensors(df, device)
+    points = tuple(
+        torch.as_tensor(array, dtype=torch.float64, device=device)
+        for array in generate_pde_points(C.N_PDE, stage=1)
+    )
+    return PINN(*data, *points, device=device)
+
+
+def _load_data(path):
+    return uniform_grid_sample(
+        load_csv_folder(path), grid_size=C.GRID_SIZE,
+        num_time_points=C.N_TIME_POINTS, tol=C.SAMPLING_TOL,
+    )
+
+
+def _batch_size(args):
+    return 16 if args.smoke else 512
+
+
+def _fit_healthy(model, args, finetune=False):
+    if finetune:
+        model.set_finetune_mode()
+    else:
+        model.set_stage(1)
+    model.w_pde = C.W_PDE
+    model.w_data = C.W_DATA_S1
+    epochs = C.FINETUNE_EPOCHS if finetune else C.S1_ADAM_EPOCHS
+    model.train(epochs, _batch_size(args), stage=1)
+    if not finetune and C.S1_LBFGS_EPOCHS > 0:
+        model.train_lbfgs(
+            C.S1_LBFGS_EPOCHS, subset=C.PDE_LBFGS_SUBSET,
+            max_iter=2 if args.smoke else 50,
+        )
+
+
+def _save_plots(models, final_model, output):
+    """Load plotting dependencies only when plots are requested."""
+    try:
+        from .plot import save_diagnostics
+    except ImportError:
+        from plot import save_diagnostics
+    save_diagnostics(models, final_model, output)
+
+
+def main(argv=None):
+    """Validate all inputs, run the schedule, and save inspectable artifacts."""
+    args = parse_args(argv)
+    apply_runtime_config(args)
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested, but torch.cuda.is_available() is false.")
+    device = torch.device(
+        "cuda" if args.device == "auto" and torch.cuda.is_available()
+        else "cpu" if args.device == "auto" else args.device
+    )
+    healthy = _load_data(args.healthy)
+    damaged = _load_data(args.damaged)
+    simulated = _load_data(args.pretrain) if args.pretrain is not None else None
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    config = {
+        "settings": {key: value for key, value in vars(C).items() if key.isupper()},
+        "run": {
+            "healthy": str(args.healthy.resolve()),
+            "damaged": str(args.damaged.resolve()),
+            "pretrain": str(args.pretrain.resolve()) if args.pretrain else None,
+            "output": str(output), "device": str(device),
+            "smoke": args.smoke, "plots": args.plots,
+            "torch_version": torch.__version__,
+            "rows": {"healthy": len(healthy), "damaged": len(damaged),
+                     "pretrain": len(simulated) if simulated is not None else 0},
+        },
+        "data_convention": (
+            "t,x,y in [0,1]; u normalised; all datasets must share the same "
+            "physical and amplitude scales. No units are inferred."
+        ),
+    }
+    (output / "config.json").write_text(
+        json.dumps(config, indent=2), encoding="utf-8"
+    )
+    print(f"Device: {device}; output: {output}")
+    if args.smoke:
+        print("SMOKE RUN: verifies execution only, not inverse identification accuracy.")
+    start = time.perf_counter()
+    models = {}
+    if simulated is not None:
+        pretrain = build_model(simulated, device)
+        _fit_healthy(pretrain, args)
+        pretrain.save_model(output / "pretrain_model.pth")
+        models["pretrain"] = pretrain
+        baseline = build_model(healthy, device)
+        baseline.net.load_state_dict(pretrain.net.state_dict())
+        _fit_healthy(baseline, args, finetune=True)
+    else:
+        print("No --pretrain: fitting a healthy baseline directly.")
+        baseline = build_model(healthy, device)
+        _fit_healthy(baseline, args)
+    baseline.save_model(output / "stage1_model.pth")
+    models["stage1"] = baseline
+
+    joint = build_model(damaged, device)
+    joint.net.load_state_dict(baseline.net.state_dict())
+    joint.init_damage_params()
+    joint.set_stage(2)
+    joint.w_pde, joint.w_data = C.W_PDE, C.W_DATA_S2
+    joint.w_reg_r, joint.w_reg_g = C.W_REG_R_S2, C.W_REG_G_S2
+    joint.train(C.S2_EPOCHS, _batch_size(args), stage=2, joint_training=True)
+    joint.save_model(output / "stage2_model.pth")
+    models["stage2"] = joint
+
+    final = build_model(damaged, device)
+    final.load_model(output / "stage2_model.pth")
+    final.set_stage(3)
+    final.w_pde, final.w_data = C.W_PDE, C.W_DATA_S3
+    final.w_reg_r, final.w_reg_g = C.W_REG_R_S3, C.W_REG_G_S3
+    final.train(C.S3_EPOCHS, _batch_size(args), stage=3, start_epoch=C.S2_EPOCHS)
+    final.save_model(output / "stage3_final_model.pth")
+    final.save_damage_params(output / "damage_params_final.npz")
+    models["stage3"] = final
+    metrics = final.evaluate()
+    metrics.update(
+        smoke=args.smoke, elapsed_seconds=time.perf_counter() - start,
+        evaluation_scope="training observations only; no held-out accuracy claim",
+        transfer_pretraining_used=simulated is not None,
+    )
+    (output / "metrics.json").write_text(
+        json.dumps(metrics, indent=2, allow_nan=False), encoding="utf-8"
+    )
+    if args.plots:
+        _save_plots(models, final, output)
+    print(json.dumps(metrics, indent=2, allow_nan=False))
+    return metrics
 
 
 if __name__ == "__main__":
