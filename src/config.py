@@ -1,6 +1,8 @@
 # config.py  —  Kirchhoff-Love plate damage identification PINN
 # All hyper-parameters and physical constants in one place.
 # Edit DATA_HEALTHY / DATA_DAMAGE to point to your COMSOL output folders.
+# Incomplete manuscript settings use engineering defaults; see docs/paper_alignment.md.
+# CSV coordinates are already normalized; the physical spans below must match them.
 
 import os
 
@@ -16,7 +18,11 @@ LAAF        = False
 
 # ── Optimiser ─────────────────────────────────────────────────────────────────
 LR_NET      = 1e-3
-LR_DAMAGE   = 1e-3       # network lr in Stage 2/3 = LR_DAMAGE * 0.1
+LR_DAMAGE   = 1e-3
+LR_DAMAGE_FINE = 5e-4
+LR_DAMAGE_REFINE = 1e-4
+LR_TRANSFER = 1e-4
+LR_INVERSE_NET = 5e-5
 F_SCL       = "minmax"
 
 # ── Physical constants ────────────────────────────────────────────────────────
@@ -26,24 +32,24 @@ RHO0        = 2700.0     # background density (kg/m3)
 H_PLATE     = 0.001      # plate thickness (m)
 X_PHYSICAL  = 0.3        # plate length (m)
 Y_PHYSICAL  = 0.3        # plate width  (m)
-T_PHYSICAL  = 8e-5       # physical time scale (s)
-DELTA_SIGMA = 300.0      # fixed areal-density change of damage (kg/m2)
-BETA        = 60.0       # sigmoid sharpness (fixed)
+T_PHYSICAL  = 8e-5       # assumed time span (s); set to your aligned data window
+DELTA_SIGMA = 300.0      # assumed increment (kg/m2), not specified in manuscript
+BETA        = 100.0      # inverse distance in units of X_PHYSICAL
 
 # ── Damage parameterisation ────────────────────────────────────────────────────
 K_MAX          = 3
 INIT_POSITIONS = [(0.5, 0.5), (0.3, 0.7), (0.7, 0.3)]
-INIT_RADII_MM  = [9.0, 3.0, 6.0]
+INIT_RADII_MM  = [3.0, 6.0, 9.0]
 INIT_ALPHA     = [0.5, 0.5, 0.5]
 
 # ── Loss weights ───────────────────────────────────────────────────────────────
-W_PDE       = 1.0
-W_DATA_S1   = 10000.0
-W_DATA_S2   = 100.0
-W_DATA_S3   = 100.0
-W_REG_R_S2  = 1e-5
+W_PDE       = 1000.0
+W_DATA_S1   = 1.0
+W_DATA_S2   = 1.0
+W_DATA_S3   = 1.0
+W_REG_R_S2  = 1e-3
 W_REG_G_S2  = 1e-4
-W_REG_R_S3  = 1e-5
+W_REG_R_S3  = 1e-3
 W_REG_G_S3  = 1e-4
 
 # ── Sampling ───────────────────────────────────────────────────────────────────
@@ -56,14 +62,16 @@ SAMPLING_TOL     = 0.01
 # ── Training schedule ─────────────────────────────────────────────────────────
 S1_ADAM_EPOCHS           = 9000
 S1_LBFGS_EPOCHS          = 1000
+FINETUNE_EPOCHS         = 1000
 S2_EPOCHS                = 1000
 S3_EPOCHS                = 1000
 ADAPTIVE_UPDATE_INTERVAL = 500
-S2_EARLY_PHASE           = 2000
+S2_EARLY_PHASE           = 500
 
 # ── Misc ───────────────────────────────────────────────────────────────────────
 F_MNTR = 50
 R_SEED = 1234
+ENABLE_PLOTS = False
 
 # ── Data paths ─────────────────────────────────────────────────────────────────
 # Point to folders containing COMSOL-exported CSV files (columns: t, x, y, u).
@@ -73,10 +81,13 @@ DATA_DAMAGE  = os.path.join(_HERE, "..", "data", "damaged")
 
 
 def get_config():
+    """Legacy lowercase configuration view; CLI saves every uppercase setting."""
     return dict(
         f_in=F_IN, f_out=F_OUT, width=WIDTH, depth=DEPTH,
         w_init=W_INIT, b_init=B_INIT, act=ACTIVATION, laaf=LAAF,
         f_scl=F_SCL, lr=LR_NET, lr_damage=LR_DAMAGE,
+        lr_damage_fine=LR_DAMAGE_FINE, lr_damage_refine=LR_DAMAGE_REFINE,
+        lr_transfer=LR_TRANSFER, lr_inverse_net=LR_INVERSE_NET,
         E=E, nu=NU, rho0=RHO0, h=H_PLATE,
         X_physical=X_PHYSICAL, Y_physical=Y_PHYSICAL, T_physical=T_PHYSICAL,
         delta_sigma=DELTA_SIGMA, beta=BETA, K_max=K_MAX,
@@ -88,6 +99,7 @@ def get_config():
         N_PDE=N_PDE, pde_lbfgs_subset=PDE_LBFGS_SUBSET,
         grid_size=GRID_SIZE, num_time_points=N_TIME_POINTS, sampling_tol=SAMPLING_TOL,
         s1_adam=S1_ADAM_EPOCHS, s1_lbfgs=S1_LBFGS_EPOCHS,
+        finetune_epochs=FINETUNE_EPOCHS,
         s2_epochs=S2_EPOCHS, s3_epochs=S3_EPOCHS,
         adaptive_interval=ADAPTIVE_UPDATE_INTERVAL, s2_early_phase=S2_EARLY_PHASE,
         f_mntr=F_MNTR, r_seed=R_SEED, t_max_star=1.0,

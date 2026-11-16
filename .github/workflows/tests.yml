@@ -1,0 +1,25 @@
+name: Physics and workflow checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - run: python -m compileall -q src scripts tests
+      - run: python -m pytest -q
+      - run: python scripts/generate_demo.py --output data/demo
+      - run: python -m src.main --pretrain data/demo/healthy --healthy data/demo/healthy --damaged data/demo/damaged --output results/check --device cpu --smoke --plots

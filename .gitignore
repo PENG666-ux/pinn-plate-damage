@@ -30,6 +30,9 @@ stage_*_snapshots/
 .DS_Store
 Thumbs.db
 *.swp
+.pytest_cache/
+data/demo/
+results/
 
 # ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/

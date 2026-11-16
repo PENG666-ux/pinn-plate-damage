@@ -1,216 +1,229 @@
-# sampling.py
+"""Reproducible collocation sampling and validated, normalised CSV data."""
+
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
-
-try:
-    from scipy.stats import qmc
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
+from scipy.spatial import cKDTree
+from scipy.stats import qmc
 
 
-# ---------------------------------------------------------------------------
-# Collocation point generators
-# ---------------------------------------------------------------------------
+def _count(n: int) -> int:
+    if not isinstance(n, (int, np.integer)) or n < 0:
+        raise ValueError("Sample count must be a non-negative integer.")
+    return int(n)
 
-def lhs_points(n, t_range=(0., 1.), x_range=(0., 1.), y_range=(0., 1.)):
-    """Latin hypercube samples over (t, x, y)."""
-    if SCIPY_AVAILABLE:
-        sampler = qmc.LatinHypercube(d=3)
-        s = sampler.random(n=n)
-        s = qmc.scale(s, [t_range[0], x_range[0], y_range[0]],
-                         [t_range[1], x_range[1], y_range[1]])
-    else:
-        s = np.random.uniform(
-            [t_range[0], x_range[0], y_range[0]],
-            [t_range[1], x_range[1], y_range[1]],
-            size=(n, 3)
+
+def _columns(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    return points[:, 0:1], points[:, 1:2], points[:, 2:3]
+
+
+def lhs_points(
+    n: int,
+    t_range: tuple[float, float] = (0.0, 1.0),
+    x_range: tuple[float, float] = (0.0, 1.0),
+    y_range: tuple[float, float] = (0.0, 1.0),
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Latin hypercube points; omitted seed respects ``np.random.seed``."""
+    n = _count(n)
+    bounds = np.asarray([t_range, x_range, y_range], dtype=float)
+    if not np.isfinite(bounds).all() or np.any(bounds[:, 0] >= bounds[:, 1]):
+        raise ValueError("Each sampling range must have finite lower < upper.")
+    if n == 0:
+        return _columns(np.empty((0, 3)))
+    if seed is None:
+        seed = int(np.random.randint(0, 2**32 - 1, dtype=np.int64))
+    points = qmc.LatinHypercube(d=3, seed=seed).random(n=n)
+    return _columns(qmc.scale(points, bounds[:, 0], bounds[:, 1]))
+
+
+def boundary_points(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Exactly n points on spatial edges, with t uniform on [0, 1]."""
+    n = _count(n)
+    points = np.random.uniform(size=(n, 3))
+    edge = np.arange(n) % 4
+    points[edge == 0, 1] = 0.0
+    points[edge == 1, 1] = 1.0
+    points[edge == 2, 2] = 0.0
+    points[edge == 3, 2] = 1.0
+    return _columns(points)
+
+
+def _site_counts(n, centres, radii, weights):
+    centres = np.asarray(centres, dtype=float).reshape(-1, 2)
+    radii = np.asarray(radii, dtype=float)
+    weights = np.asarray(weights, dtype=float).copy()
+    if len(centres) != len(radii) or len(radii) != len(weights):
+        raise ValueError("Centres, radii and weights must have equal lengths.")
+    if not len(weights):
+        return centres, radii, np.empty(0, dtype=int)
+    if (
+        not np.isfinite(centres).all()
+        or not np.isfinite(radii).all()
+        or not np.isfinite(weights).all()
+        or np.any(radii < 0)
+        or np.any(weights < 0)
+    ):
+        raise ValueError("Damage sites and weights must be finite and non-negative.")
+    if np.any((centres < 0) | (centres > 1)):
+        raise ValueError("Normalised damage centres must be in [0, 1].")
+    if weights.sum() == 0:
+        return centres, radii, np.empty(0, dtype=int)
+    return centres, radii, np.random.multinomial(n, weights / weights.sum())
+
+
+def _damage_points(n, centres, radii, weights, hires=False, sigma_factor=2.0):
+    n = _count(n)
+    if n == 0:
+        return _columns(np.empty((0, 3)))
+    centres, radii, counts = _site_counts(n, centres, radii, weights)
+    if not len(counts):
+        return lhs_points(n)
+    blocks = []
+    for (cx, cy), radius, count in zip(centres, radii, counts):
+        if count == 0:
+            continue
+        sigma = max(radius * sigma_factor, 0.03 if hires else 0.05)
+        xs = np.random.normal(cx, sigma, count)
+        ys = np.random.normal(cy, sigma, count)
+        if hires:
+            n_inside = int(count * 0.7)
+            rs = radius * np.sqrt(np.random.uniform(size=n_inside))
+            angles = np.random.uniform(0.0, 2.0 * np.pi, n_inside)
+            xs[:n_inside] = cx + rs * np.cos(angles)
+            ys[:n_inside] = cy + rs * np.sin(angles)
+        blocks.append(
+            np.column_stack(
+                [np.random.uniform(size=count), np.clip(xs, 0, 1), np.clip(ys, 0, 1)]
+            )
         )
-    return s[:, 0:1], s[:, 1:2], s[:, 2:3]
-
-
-def boundary_points(n):
-    """Uniform samples on the four spatial boundaries, t uniform in [0,1]."""
-    n_per = n // 4
-    segs = []
-    for _ in range(n_per):       # x=0
-        segs.append([np.random.uniform(), 0., np.random.uniform()])
-    for _ in range(n_per):       # x=1
-        segs.append([np.random.uniform(), 1., np.random.uniform()])
-    for _ in range(n_per):       # y=0
-        segs.append([np.random.uniform(), np.random.uniform(), 0.])
-    for _ in range(n - 3 * n_per):  # y=1
-        segs.append([np.random.uniform(), np.random.uniform(), 1.])
-    arr = np.array(segs, dtype=np.float64)
-    return arr[:, 0:1], arr[:, 1:2], arr[:, 2:3]
+    return _columns(np.vstack(blocks))
 
 
 def damage_focused_points(n, centres, radii, weights, sigma_factor=2.0):
-    """Gaussian samples centred on active damage sites, weighted by alpha."""
-    weights = np.asarray(weights, dtype=float)
-    weights /= weights.sum()
-    t_list, x_list, y_list = [], [], []
-    for (cx, cy), r, w in zip(centres, radii, weights):
-        k = max(int(n * w), 10)
-        sigma = max(r * sigma_factor, 0.05)
-        xs = np.clip(np.random.normal(cx, sigma, k), 0., 1.)
-        ys = np.clip(np.random.normal(cy, sigma, k), 0., 1.)
-        ts = np.random.uniform(0., 1., k)
-        t_list.append(ts.reshape(-1, 1))
-        x_list.append(xs.reshape(-1, 1))
-        y_list.append(ys.reshape(-1, 1))
-    t = np.vstack(t_list)
-    x = np.vstack(x_list)
-    y = np.vstack(y_list)
-    if len(t) > n:
-        idx = np.random.choice(len(t), n, replace=False)
-        t, x, y = t[idx], x[idx], y[idx]
-    return t, x, y
+    """Exactly n Gaussian samples around sites, distributed by gate weights."""
+    return _damage_points(n, centres, radii, weights, sigma_factor=sigma_factor)
 
 
 def damage_focused_points_hires(n, centres, radii, weights):
-    """High-resolution sampling: 70% inside the damage disc, 30% near edge."""
-    weights = np.asarray(weights, dtype=float)
-    weights /= weights.sum()
-    t_list, x_list, y_list = [], [], []
-    for (cx, cy), r, w in zip(centres, radii, weights):
-        k = max(int(n * w), 20)
-        n_in = int(k * 0.7)
-        n_out = k - n_in
-        # inner disc
-        r_samp = r * np.sqrt(np.random.uniform(0, 1, n_in))
-        theta = np.random.uniform(0, 2 * np.pi, n_in)
-        xs_in = np.clip(cx + r_samp * np.cos(theta), 0., 1.)
-        ys_in = np.clip(cy + r_samp * np.sin(theta), 0., 1.)
-        # outer annulus
-        sigma = max(r * 1.5, 0.03)
-        xs_out = np.clip(np.random.normal(cx, sigma, n_out), 0., 1.)
-        ys_out = np.clip(np.random.normal(cy, sigma, n_out), 0., 1.)
-        xs = np.concatenate([xs_in, xs_out])
-        ys = np.concatenate([ys_in, ys_out])
-        ts = np.random.uniform(0., 1., k)
-        t_list.append(ts.reshape(-1, 1))
-        x_list.append(xs.reshape(-1, 1))
-        y_list.append(ys.reshape(-1, 1))
-    t = np.vstack(t_list)
-    x = np.vstack(x_list)
-    y = np.vstack(y_list)
-    if len(t) > n:
-        idx = np.random.choice(len(t), n, replace=False)
-        t, x, y = t[idx], x[idx], y[idx]
-    return t, x, y
+    """Approximately 70% within discs and 30% nearby; exactly n points total."""
+    return _damage_points(n, centres, radii, weights, hires=True, sigma_factor=1.5)
 
 
-def generate_pde_points(N, stage=1, epoch=0, alpha_vals=None,
-                        x_vals=None, y_vals=None, r_vals=None,
-                        stage2_switch=2000):
-    """
-    Generate collocation points according to current stage and epoch.
-
-    Stage 1 / Stage 2 early  : 80 % LHS + 20 % boundary
-    Stage 2 late             : 60 % damage-focused + 30 % uniform + 10 % boundary
-    Stage 3                  : 80 % damage-focused (hi-res) + 15 % uniform + 5 % boundary
-    """
+def generate_pde_points(
+    N,
+    stage=1,
+    epoch=0,
+    alpha_vals=None,
+    x_vals=None,
+    y_vals=None,
+    r_vals=None,
+    stage2_switch=2000,
+):
+    """Collocation mixture. Edge samples enforce the PDE, not a boundary loss."""
+    N = _count(N)
+    if stage not in (1, 2, 3):
+        raise ValueError("stage must be 1, 2 or 3.")
     if stage == 1 or (stage == 2 and epoch < stage2_switch):
-        n_lhs = int(N * 0.8)
-        n_bnd = N - n_lhs
-        t1, x1, y1 = lhs_points(n_lhs)
-        t2, x2, y2 = boundary_points(n_bnd)
-        t = np.vstack([t1, t2])
-        x = np.vstack([x1, x2])
-        y = np.vstack([y1, y2])
-        return t.astype(np.float64), x.astype(np.float64), y.astype(np.float64)
-
-    active = np.where(alpha_vals > 1e-3)[0] if alpha_vals is not None else np.array([])
-
-    if stage == 2:
-        n_dmg = int(N * 0.6)
-        n_glo = int(N * 0.3)
-        n_bnd = N - n_dmg - n_glo
-    else:  # stage 3
-        n_dmg = int(N * 0.8)
-        n_glo = int(N * 0.15)
-        n_bnd = N - n_dmg - n_glo
-
-    t_glo = np.random.uniform(0., 1., (n_glo, 1)).astype(np.float64)
-    x_glo = np.random.uniform(0., 1., (n_glo, 1)).astype(np.float64)
-    y_glo = np.random.uniform(0., 1., (n_glo, 1)).astype(np.float64)
-    t_bnd, x_bnd, y_bnd = boundary_points(n_bnd)
-
-    if len(active) == 0:
-        t_dmg, x_dmg, y_dmg = lhs_points(n_dmg)
+        n_global = int(N * 0.8)
+        groups = [lhs_points(n_global), boundary_points(N - n_global)]
     else:
-        centres = [(x_vals[i], y_vals[i]) for i in active]
-        radii   = [r_vals[i] for i in active]
-        weights = alpha_vals[active]
-        if stage == 3:
-            t_dmg, x_dmg, y_dmg = damage_focused_points_hires(n_dmg, centres, radii, weights)
+        n_damage = int(N * (0.6 if stage == 2 else 0.8))
+        n_global = int(N * (0.3 if stage == 2 else 0.15))
+        n_boundary = N - n_damage - n_global
+        alpha = np.asarray(alpha_vals if alpha_vals is not None else [], dtype=float)
+        active = np.flatnonzero(alpha > 1e-3)
+        if len(active):
+            if any(v is None for v in (x_vals, y_vals, r_vals)):
+                raise ValueError("Active gates require x_vals, y_vals and r_vals.")
+            centres = list(zip(np.asarray(x_vals)[active], np.asarray(y_vals)[active]))
+            sampler = damage_focused_points_hires if stage == 3 else damage_focused_points
+            damage = sampler(
+                n_damage, centres, np.asarray(r_vals)[active], alpha[active]
+            )
         else:
-            t_dmg, x_dmg, y_dmg = damage_focused_points(n_dmg, centres, radii, weights)
-
-    t = np.vstack([t_glo, t_bnd, t_dmg])
-    x = np.vstack([x_glo, x_bnd, x_dmg])
-    y = np.vstack([y_glo, y_bnd, y_dmg])
-    return t.astype(np.float64), x.astype(np.float64), y.astype(np.float64)
+            damage = lhs_points(n_damage)
+        groups = [lhs_points(n_global), boundary_points(n_boundary), damage]
+    return tuple(np.vstack([group[i] for group in groups]) for i in range(3))
 
 
 def to_tensor(arr, device, dtype=torch.float64):
-    return torch.tensor(arr, dtype=dtype, device=device)
+    """Convert an array to the training dtype and device."""
+    return torch.as_tensor(arr, dtype=dtype, device=device)
 
 
-# ---------------------------------------------------------------------------
-# Data loading and uniform-grid sub-sampling
-# ---------------------------------------------------------------------------
+def validate_dataframe(df: pd.DataFrame, source: str = "data") -> pd.DataFrame:
+    """Validate already normalised t,x,y,u without guessing physical units.
 
-def load_csv_folder(folder):
-    import os
+    All datasets must share the same physical normalisation scales. This function
+    does not normalise each dataset independently.
+    """
+    required = ["t", "x", "y", "u"]
+    missing = set(required) - set(df.columns)
+    if missing:
+        raise ValueError(f"{source}: missing CSV columns {sorted(missing)}.")
+    if df.empty:
+        raise ValueError(f"{source}: no data rows.")
+    try:
+        df = df.loc[:, required].apply(pd.to_numeric, errors="raise").astype(float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source}: t,x,y,u must all be numeric.") from exc
+    if not np.isfinite(df.to_numpy()).all():
+        raise ValueError(f"{source}: data contains NaN or infinity.")
+    if ((df[["t", "x", "y"]] < 0) | (df[["t", "x", "y"]] > 1)).any().any():
+        raise ValueError(f"{source}: normalised t,x,y must lie in [0,1].")
+    df = df.drop_duplicates().sort_values(["x", "y", "t"], kind="stable")
+    if df.duplicated(["t", "x", "y"]).any():
+        raise ValueError(f"{source}: conflicting u values at the same t,x,y.")
+    return df.reset_index(drop=True)
+
+
+def load_csv_folder(folder: str | Path) -> pd.DataFrame:
+    """Read every CSV deterministically and fail on malformed input."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"CSV folder does not exist: {folder}")
+    files = sorted(p for p in folder.iterdir() if p.suffix.lower() == ".csv")
+    if not files:
+        raise ValueError(f"No CSV files found in {folder}.")
     frames = []
-    for fname in os.listdir(folder):
-        if fname.endswith('.csv'):
-            try:
-                frames.append(pd.read_csv(os.path.join(folder, fname)))
-            except Exception as e:
-                print(f"Warning: skipped {fname}: {e}")
-    if not frames:
-        raise RuntimeError(f"No CSV files found in {folder}")
-    return pd.concat(frames, ignore_index=True)
+    for path in files:
+        try:
+            df = pd.read_csv(path)
+        except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+            raise ValueError(f"Cannot read CSV {path}: {exc}") from exc
+        frames.append(validate_dataframe(df, str(path)))
+    return validate_dataframe(pd.concat(frames, ignore_index=True), str(folder))
 
 
 def uniform_grid_sample(df, grid_size=15, num_time_points=80, tol=0.01):
-    """
-    Sub-sample df onto a regular grid_size × grid_size spatial grid,
-    keeping num_time_points per location.
-    """
-    if df.empty:
-        raise ValueError("Input dataframe is empty.")
+    """Select distinct nearest sensor locations, then ordered time snapshots.
 
-    x_pts = np.linspace(df['x'].min(), df['x'].max(), grid_size)
-    y_pts = np.linspace(df['y'].min(), df['y'].max(), grid_size)
-
+    Tolerance is the maximum absolute coordinate difference. Nearby sensors
+    remain distinct; a location selected twice is used only once.
+    """
+    if grid_size < 1 or num_time_points < 1 or tol <= 0:
+        raise ValueError("grid_size, num_time_points and tol must be positive.")
+    df = validate_dataframe(df)
+    locations = df[["x", "y"]].drop_duplicates().to_numpy()
+    xs = np.linspace(locations[:, 0].min(), locations[:, 0].max(), grid_size)
+    ys = np.linspace(locations[:, 1].min(), locations[:, 1].max(), grid_size)
+    grid = np.array(np.meshgrid(xs, ys)).reshape(2, -1).T
+    distances, indices = cKDTree(locations).query(grid, p=np.inf)
+    selected = sorted(set(indices[distances <= tol].tolist()))
+    if not selected:
+        raise ValueError("No spatial grid locations matched within tolerance.")
+    groups = df.groupby(["x", "y"], sort=False)
     pieces = []
-    found = 0
-    for xv in x_pts:
-        for yv in y_pts:
-            mask = (np.abs(df['x'] - xv) < tol) & (np.abs(df['y'] - yv) < tol)
-            sub = df[mask]
-            if sub.empty:
-                continue
-            # use the first matched coordinate to avoid floating-point spread
-            mx, my = sub.iloc[0]['x'], sub.iloc[0]['y']
-            sub = df[(np.abs(df['x'] - mx) < tol) & (np.abs(df['y'] - my) < tol)]
-            if len(sub) >= num_time_points:
-                idx = np.linspace(0, len(sub) - 1, num_time_points, dtype=int)
-                sub = sub.iloc[idx]
-            pieces.append(sub)
-            found += 1
-
-    if found == 0:
-        raise RuntimeError("No spatial grid points matched within tolerance.")
-
+    for index in selected:
+        location = tuple(locations[index])
+        rows = groups.get_group(location).sort_values("t", kind="stable")
+        count = min(num_time_points, len(rows))
+        positions = np.linspace(0, len(rows) - 1, count, dtype=int)
+        pieces.append(rows.iloc[positions])
     result = pd.concat(pieces, ignore_index=True)
-    n_spatial = result[['x', 'y']].drop_duplicates().__len__()
-    print(f"Grid sampling: {found}/{grid_size**2} locations matched, "
-          f"{n_spatial} unique, {len(result)} total points.")
+    print(f"Grid sampling: {len(selected)} distinct locations, {len(result)} rows")
     return result

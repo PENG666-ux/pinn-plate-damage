@@ -3,32 +3,39 @@ pinn.py  —  PINN for Kirchhoff-Love plate damage identification
 Three-stage training: healthy network → joint optimisation → refinement.
 """
 
-import os
 import time
 import numpy as np
 import torch
 import torch.nn as nn
 
 try:
-    from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
-    _SCIPY = True
+    from .network import DNN
+    from .sampling import generate_pde_points
+    from . import config as C
 except ImportError:
-    _SCIPY = False
+    from network import DNN
+    from sampling import generate_pde_points
+    import config as C
 
-from network import DNN
-from sampler import lhs_points, adaptive_points
-import config as C
+
+def adaptive_points(n, stage, epoch, xc, yc, rc, alpha, early_phase):
+    """Use the shared sampler; all mask radii are normalized by Lx."""
+    return generate_pde_points(
+        n, stage=stage, epoch=epoch, alpha_vals=alpha,
+        x_vals=xc, y_vals=yc, r_vals=rc, stage2_switch=early_phase)
 
 
 class PINN:
     def __init__(self,
                  t_data, x_data, y_data, u_data,
                  t_pde,  x_pde,  y_pde,
-                 device='cuda'):
+                 device='cpu'):
 
         self.device = device
         self.dtype  = torch.float64
-        torch.manual_seed(C.R_SEED);  torch.cuda.manual_seed(C.R_SEED)
+        torch.manual_seed(C.R_SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(C.R_SEED)
         np.random.seed(C.R_SEED)
 
         # ── Physical parameters ──────────────────────────────────────────────
@@ -39,32 +46,59 @@ class PINN:
         self.Lx         = C.X_PHYSICAL
         self.Ly         = C.Y_PHYSICAL
         self.T_phys     = C.T_PHYSICAL
+        if (min(self.E, self.rho, self.h, self.Lx, self.Ly, self.T_phys) <= 0
+                or not -1 < self.nu < 0.5):
+            raise ValueError('Require positive material/scales and Poisson ratio in (-1,0.5).')
+        if C.F_IN != 3 or C.F_OUT != 1 or C.DEPTH < 1 or C.WIDTH < 1:
+            raise ValueError('Require three inputs, one output and positive network dimensions.')
         self.D          = self.E * self.h**3 / (12.0 * (1.0 - self.nu**2))
         self.pde_coeff  = (self.rho * self.h * self.Lx**4) / (self.D * self.T_phys**2)
         self.delta_sig  = C.DELTA_SIGMA
         self.beta       = C.BETA
         self.n_max      = C.K_MAX
+        if self.n_max < 1 or self.delta_sig < 0 or self.beta <= 0:
+            raise ValueError('Require K_MAX >= 1, DELTA_SIGMA >= 0, BETA > 0.')
 
         # ── Data tensors ─────────────────────────────────────────────────────
         def _t(arr):
-            return arr.to(device, dtype=self.dtype) if arr is not None else None
+            if arr is None:
+                return None
+            value = torch.as_tensor(arr, dtype=self.dtype, device=device).detach()
+            if value.ndim != 2 or value.shape[1] != 1 or len(value) == 0:
+                raise ValueError('Each input tensor must have shape (N,1), N > 0.')
+            if not torch.isfinite(value).all():
+                raise ValueError('Input tensors must be finite.')
+            return value
 
         self.t_data, self.x_data, self.y_data, self.u_data = (
             _t(t_data), _t(x_data), _t(y_data), _t(u_data))
         self.t_pde, self.x_pde, self.y_pde = _t(t_pde), _t(x_pde), _t(y_pde)
 
+        for group in ((self.t_data, self.x_data, self.y_data, self.u_data),
+                      (self.t_pde, self.x_pde, self.y_pde)):
+            if any(v is None for v in group) and not all(v is None for v in group):
+                raise ValueError('Provide all or none of each data/PDE tensor group.')
+            if group[0] is not None and len({len(v) for v in group}) != 1:
+                raise ValueError('Lengths within each tensor group must match.')
+        if self.t_data is None and self.t_pde is None:
+            raise ValueError('Provide observations or PDE points.')
+        for value in (self.t_data, self.x_data, self.y_data,
+                      self.t_pde, self.x_pde, self.y_pde):
+            if value is not None and ((value < 0).any() or (value > 1).any()):
+                raise ValueError('Normalize t,x,y to [0,1] before constructing the model.')
         self._update_feature_bounds()
 
         # ── Network ──────────────────────────────────────────────────────────
-        layers = [C.F_IN] + (C.DEPTH - 1) * [C.WIDTH] + [C.F_OUT]
+        layers = [C.F_IN] + C.DEPTH * [C.WIDTH] + [C.F_OUT]
+        self.layers = layers
         self.net = DNN(layers, C.W_INIT, C.B_INIT, C.ACTIVATION,
                        C.LAAF, self.dtype).to(device)
 
         # ── Damage parameters (reparameterised) ──────────────────────────────
-        self.raw_alpha = nn.Parameter(torch.empty(self.n_max, dtype=self.dtype).uniform_(-2., 1.))
-        self.raw_x_i   = nn.Parameter(torch.empty(self.n_max, dtype=self.dtype).uniform_(-2., 2.))
-        self.raw_y_i   = nn.Parameter(torch.empty(self.n_max, dtype=self.dtype).uniform_(-2., 2.))
-        self.raw_r_i   = nn.Parameter(torch.empty(self.n_max, dtype=self.dtype).uniform_(-2., 1.))
+        self.raw_alpha = nn.Parameter(torch.zeros(self.n_max, dtype=self.dtype, device=device))
+        self.raw_x_i = nn.Parameter(torch.zeros(self.n_max, dtype=self.dtype, device=device))
+        self.raw_y_i = nn.Parameter(torch.zeros(self.n_max, dtype=self.dtype, device=device))
+        self.raw_r_i = nn.Parameter(torch.zeros(self.n_max, dtype=self.dtype, device=device))
 
         # ── Training state ───────────────────────────────────────────────────
         self.stage       = 0
@@ -75,6 +109,9 @@ class PINN:
         self.w_reg_g     = C.W_REG_G_S2
         self.adaptive_on = False
         self.last_adapt  = 0
+        self.finetune_mode = False
+        self.radius_released = False
+        self.init_damage_params()
 
         # ── Logging ──────────────────────────────────────────────────────────
         self.ep_log          = [];  self.loss_log       = []
@@ -88,16 +125,7 @@ class PINN:
         self.lbfgs_data_hist = [];  self.lbfgs_grad_norms = []
         self.gradient_history  = [];  self.gradient_epochs = []
 
-        # ── Data interpolator (for gradient-field visualisation) ──────────────
-        self._data_interp   = None
-        self._nearest_interp = None
-        if self.t_data is not None and _SCIPY:
-            pts = np.hstack([
-                self.t_data.detach().cpu().numpy(),
-                self.x_data.detach().cpu().numpy(),
-                self.y_data.detach().cpu().numpy()])
-            vals = self.u_data.detach().cpu().numpy().flatten()
-            self._data_interp = LinearNDInterpolator(pts, vals)
+        self.set_stage(1)
 
         print(f"PINN initialised | net {layers} | data {self.t_data.shape[0] if self.t_data is not None else 0}"
               f" | PDE {self.t_pde.shape[0] if self.t_pde is not None else 0} | device {device}")
@@ -106,23 +134,10 @@ class PINN:
     # ── Feature bounds ────────────────────────────────────────────────────────
 
     def _update_feature_bounds(self):
-        parts = []
-        if self.t_pde  is not None: parts.append(torch.cat([self.t_pde,  self.t_data  if self.t_data  is not None else self.t_pde], 0))
-        if self.t_data is not None and self.t_pde is None: parts.append(self.t_data)
-        if not parts:
-            self.lb = torch.zeros(3, dtype=self.dtype, device=self.device)
-            self.ub = torch.ones (3, dtype=self.dtype, device=self.device)
-            return
-        def _mm(tensors, fn): return fn(torch.cat(tensors, 0), dim=0)[0]
-        tx = (torch.cat([self.t_pde,  self.t_data],  0) if (self.t_pde  is not None and self.t_data  is not None)
-              else (self.t_pde  if self.t_pde  is not None else self.t_data))
-        xx = (torch.cat([self.x_pde,  self.x_data],  0) if (self.x_pde  is not None and self.x_data  is not None)
-              else (self.x_pde  if self.x_pde  is not None else self.x_data))
-        yx = (torch.cat([self.y_pde,  self.y_data],  0) if (self.y_pde  is not None and self.y_data  is not None)
-              else (self.y_pde  if self.y_pde  is not None else self.y_data))
-        bounds = torch.cat([tx, xx, yx], dim=1)
-        self.lb = torch.min (bounds, dim=0)[0].to(self.device, dtype=self.dtype)
-        self.ub = torch.max (bounds, dim=0)[0].to(self.device, dtype=self.dtype)
+        """Keep normalized-domain bounds independent of observations/sampling."""
+        self.lb = torch.zeros(3, dtype=self.dtype, device=self.device)
+        self.ub = torch.ones(3, dtype=self.dtype, device=self.device)
+
 
     # ── Damage parameter properties ───────────────────────────────────────────
 
@@ -134,7 +149,7 @@ class PINN:
 
     @property
     def r_i(self):
-        """Physical radius (m)."""
+        """Physical radius (m), greater than 1 mm, with no upper bound."""
         return torch.nn.functional.softplus(self.raw_r_i) * 0.014 + 0.001
 
     @property
@@ -155,31 +170,65 @@ class PINN:
     # ── Optimiser ─────────────────────────────────────────────────────────────
 
     def _build_optimizer(self):
-        lr_net = C.LR_NET if self.stage == 1 else C.LR_DAMAGE * 0.1
-        dam_params = [self.raw_alpha, self.raw_x_i, self.raw_y_i, self.raw_r_i]
-        if self.stage == 1:
-            for p in dam_params: p.requires_grad_(False)
-            self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr_net)
-        else:
-            for p in dam_params: p.requires_grad_(True)
-            self.optimizer = torch.optim.Adam([
-                {'params': self.net.parameters(), 'lr': lr_net},
-                {'params': dam_params,            'lr': C.LR_DAMAGE}])
+        for p in self.net.parameters():
+            p.requires_grad_(False)
+            p.grad = None
+        damage = [self.raw_alpha, self.raw_x_i, self.raw_y_i, self.raw_r_i]
+        for p in damage:
+            p.requires_grad_(self.stage >= 2)
+            p.grad = None
+        groups = []
+        if self.stage == 1 and not self.finetune_mode:
+            for p in self.net.parameters():
+                p.requires_grad_(True)
+            groups.append({'params': list(self.net.parameters()), 'lr': C.LR_NET})
+        elif self.stage in (1, 2):
+            tail = list(self.net.weights[-2:]) + list(self.net.biases[-2:])
+            if self.net.laaf:
+                tail += list(self.net.alphas[-2:])
+            for p in tail:
+                p.requires_grad_(True)
+            groups.append({'params': tail, 'lr': (
+                C.LR_TRANSFER if self.stage == 1 else C.LR_INVERSE_NET)})
+        if self.stage >= 2:
+            self.raw_r_i.requires_grad_(self.stage == 3 or self.radius_released)
+            groups.append({'params': damage, 'lr': (
+                C.LR_DAMAGE_REFINE if self.stage == 3 else
+                C.LR_DAMAGE_FINE if self.radius_released else C.LR_DAMAGE)})
+        self.optimizer = torch.optim.Adam(groups)
 
     def set_stage(self, stage):
+        if stage not in (1, 2, 3):
+            raise ValueError('Stage must be 1, 2 or 3.')
         self.stage = stage
+        self.radius_released = stage == 3
         self._build_optimizer()
-        self.adaptive_on = (stage >= 2)
-        print(f"Stage {stage} set | net_lr={C.LR_NET if stage==1 else C.LR_DAMAGE*0.1:.2e}"
-              + (f" | damage_lr={C.LR_DAMAGE:.2e}" if stage >= 2 else ""))
+        self.adaptive_on = stage >= 2
+        self.last_adapt = 0
+
+    def set_finetune_mode(self):
+        self.finetune_mode = True
+        self.set_stage(1)
+
 
     # ── Damage initialisation ─────────────────────────────────────────────────
 
     def init_damage_params(self, positions=None, radii_mm=None, alphas=None):
         """Set damage parameters to the given initial guesses."""
-        positions = positions or C.INIT_POSITIONS
-        radii_mm  = radii_mm  or C.INIT_RADII_MM
-        alphas    = alphas    or C.INIT_ALPHA
+        positions = C.INIT_POSITIONS if positions is None else positions
+        radii_mm = C.INIT_RADII_MM if radii_mm is None else radii_mm
+        alphas = C.INIT_ALPHA if alphas is None else alphas
+        if min(len(positions), len(radii_mm), len(alphas)) < self.n_max:
+            raise ValueError('Provide an initial center, radius and gate per candidate.')
+        pos = np.asarray(positions[:self.n_max], dtype=float)
+        rad = np.asarray(radii_mm[:self.n_max], dtype=float)
+        gates = np.asarray(alphas[:self.n_max], dtype=float)
+        if (pos.shape != (self.n_max, 2) or not np.isfinite(pos).all()
+                or not np.isfinite(rad).all() or not np.isfinite(gates).all()
+                or (pos <= 0.04).any() or (pos >= 0.96).any()
+                or (rad <= 1).any() or (gates <= 0).any() or (gates >= 1).any()):
+            raise ValueError('Initial centers must be in (0.04,0.96), radius > 1 mm, '
+                             'and gates in (0,1).')
 
         m, s = 0.04, 1.0 - 2*0.04
 
@@ -198,10 +247,10 @@ class PINN:
 
         def _pt(lst): return torch.tensor(lst, dtype=self.dtype, device=self.device)
         with torch.no_grad():
-            self.raw_alpha.data = _pt(raw_a)
-            self.raw_x_i.data   = _pt(raw_x)
-            self.raw_y_i.data   = _pt(raw_y)
-            self.raw_r_i.data   = _pt(raw_r)
+            self.raw_alpha.copy_(_pt(raw_a))
+            self.raw_x_i.copy_(_pt(raw_x))
+            self.raw_y_i.copy_(_pt(raw_y))
+            self.raw_r_i.copy_(_pt(raw_r))
 
         self._print_damage_state("Damage initialisation")
 
@@ -238,13 +287,13 @@ class PINN:
     # ── Forward + PDE residual ────────────────────────────────────────────────
 
     def _scale(self, X):
-        return 2.0 * (X - self.lb) / (self.ub - self.lb + 1e-12) - 1.0
+        return 2.0 * (X - self.lb) / (self.ub - self.lb) - 1.0
 
     def forward(self, t, x, y):
         return self.net(self._scale(torch.cat([t, x, y], dim=1)))
 
     def pde_residual(self, t, x, y):
-        t.requires_grad_(True);  x.requires_grad_(True);  y.requires_grad_(True)
+        t, x, y = (v.detach().clone().requires_grad_(True) for v in (t, x, y))
         u = self.forward(t, x, y)
 
         def _g(f, v, cg=True):
@@ -257,58 +306,45 @@ class PINN:
         u_tt = _g(u_t, t)
         u_xx = _g(u_x, x)
         u_yy = _g(u_y, y)
-        u_xy = _g(u_x, y)
         u_xxx = _g(u_xx, x);  u_xxy = _g(u_xx, y)
-        u_xyy = _g(u_xy, y);  u_yyy = _g(u_yy, y)
+        u_yyy = _g(u_yy, y)
         u_xxxx = _g(u_xxx, x)
         u_xxyy = _g(u_xxy, y)
         u_yyyy = _g(u_yyy, y)
 
-        nabla4 = u_xxxx + 2.0 * u_xxyy + u_yyyy
+        # Appendix 4: physical residual / (sigma0 * displacement_scale / Lt**2).
+        factor = self.D * self.T_phys**2 / (self.rho * self.h)
+        bending = factor * (u_xxxx / self.Lx**4
+                            + 2.0 * u_xxyy / (self.Lx**2 * self.Ly**2)
+                            + u_yyyy / self.Ly**4)
+        return self.effective_density(x, y) / (self.rho * self.h) * u_tt + bending
 
+    def effective_density(self, x, y):
+        """Eq. 5--7; physical circular masks, distance/radius both in units Lx."""
+        density = torch.ones_like(x) * self.rho * self.h
         if self.stage == 1:
-            return nabla4 + self.pde_coeff * u_tt
-
-        sig = torch.ones_like(u) * (self.rho * self.h)
+            return density
         for k in range(self.n_max):
-            d2   = (x - self.x_i[k])**2 + (y - self.y_i[k])**2
-            gate = torch.sigmoid(self.beta * (self.r_i_norm[k]**2 - d2))
-            sig  = sig + self.alpha[k] * self.delta_sig * gate
-
-        coeff = sig * self.Lx**4 / (self.D * self.T_phys**2)
-        return nabla4 + coeff * u_tt
+            distance = torch.sqrt((x - self.x_i[k])**2
+                                  + ((y - self.y_i[k]) * self.Ly / self.Lx)**2
+                                  + 1e-24)
+            mask = torch.sigmoid(self.beta * (self.r_i_norm[k] - distance))
+            density = density + self.alpha[k] * self.delta_sig * mask
+        return density
 
     # ── Regularisation ────────────────────────────────────────────────────────
 
-    def _sparsity_loss(self, epoch):
-        """
-        Encourage exactly one dominant damage site (max α → 1) while
-        suppressing the others via L1 regularisation.
-        Switches on gradually after a burn-in period.
-        """
-        if self.stage == 1: return torch.zeros(1, dtype=self.dtype, device=self.device).squeeze()
-
-        a = self.alpha
-        max_a, max_idx = torch.max(a, 0)
-
-        # burn-in: lightly encourage the dominant site to grow
-        if epoch < 2000:
-            main   = (1.0 - max_a)**2
-            others = a.clone();  others[max_idx] = 0.0
-            return 1e-4 * (main + 0.1 * torch.sum(others**2))
-
-        # later: stronger sparsification
-        w = min(1e-3, 1e-4 + (epoch - 2000) / 3000 * 9e-4)
-        others = a.clone();  others[max_idx] = 0.0
-        return w * ((1.0 - max_a)**2 + 0.5 * torch.sum(torch.abs(others)))
+    def _sparsity_loss(self, epoch=0):
+        """Eq. 21 binary gate penalty; does not force exactly one defect."""
+        return self.w_reg_g * torch.sum(self.alpha * (1 - self.alpha))
 
     def _radius_loss(self):
-        """Soft regulariser on damage radii (physical metres)."""
-        r = self.r_i
-        max_idx = torch.argmax(self.alpha)
-        main_pen  = (r[max_idx] - 0.0048)**2
-        other_pen = torch.sum((r - 0.005)**2) - (r[max_idx] - 0.005)**2
-        return self.w_reg_r * (2.0 * main_pen + 0.5 * other_pen)
+        """Eq. 20 suppresses inactive radii; no target/reference radius is used.
+
+        Radius is dimensionless in the same Lx units as the damage mask.
+        """
+        return self.w_reg_r * torch.sum((1 - self.alpha) * self.r_i_norm**2)
+
 
     # ── Loss ──────────────────────────────────────────────────────────────────
 
@@ -349,20 +385,29 @@ class PINN:
 
     # ── Adam training loop ────────────────────────────────────────────────────
 
-    def train(self, epochs, batch, lr=1e-3, stage=1,
+    def train(self, epochs, batch, lr=None, stage=1,
               start_epoch=0, joint_training=False):
+        if epochs < 1 or batch < 1:
+            raise ValueError('epochs and batch must be positive.')
         self.set_stage(stage)
+        if lr is not None:
+            for group in self.optimizer.param_groups:
+                group['lr'] = lr
         t0 = time.time()
 
         for ep in range(1, epochs + 1):
             self.global_step += 1
             g_ep = start_epoch + ep
 
-            self._refresh_pde_points(g_ep)
+            if stage == 2 and ep > C.S2_EARLY_PHASE and not self.radius_released:
+                self.radius_released = True
+                self.raw_r_i.requires_grad_(True)
+                self.optimizer.param_groups[-1]['lr'] = C.LR_DAMAGE_FINE
+            self._refresh_pde_points(ep)
 
             n_pde  = self.t_pde.shape[0]  if self.t_pde  is not None else 0
             n_data = self.t_data.shape[0] if self.t_data is not None else 0
-            n_bat  = max(max(n_pde, n_data) // max(batch, 1), 1)
+            n_bat  = max((max(n_pde, n_data) + batch - 1) // batch, 1)
 
             ep_loss = ep_pde = ep_data = ep_rr = ep_rg = 0.0
 
@@ -382,8 +427,12 @@ class PINN:
                 loss, lpde, ldata, lrr, lrg = self.compute_loss(
                     tp, xp, yp, td, xd, yd, ud, g_ep)
 
-                if torch.isnan(loss): continue
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f'Non-finite loss: stage {stage}, epoch {ep}.')
                 loss.backward()
+                if not all(p.grad is None or torch.isfinite(p.grad).all()
+                           for g in self.optimizer.param_groups for p in g['params']):
+                    raise FloatingPointError(f'Non-finite gradient in stage {stage}.')
                 self._record_gradients(g_ep)
                 self.optimizer.step()
 
@@ -394,7 +443,7 @@ class PINN:
                 ep_rg   += lrg.item()   / n_bat
 
             # Logging
-            if g_ep % C.F_MNTR == 0:
+            if g_ep % C.F_MNTR == 0 or ep == epochs:
                 self.ep_log.append(g_ep)
                 self.loss_log.append(ep_loss);   self.loss_pde_log.append(ep_pde)
                 self.loss_data_log.append(ep_data)
@@ -420,45 +469,40 @@ class PINN:
                           f"pde {ep_pde:.3e} | data {ep_data:.3e} | {time.time()-t0:.1f}s")
                 t0 = time.time()
 
-            # Periodic damage map
-            if stage >= 2 and (g_ep % 100 == 0 or g_ep == start_epoch + epochs):
-                try:
-                    from plot import plot_damage_map
-                    os.makedirs("./damage_evolution", exist_ok=True)
-                    plot_damage_map(self, f"Epoch {g_ep}",
-                                    f"Stage {stage}",
-                                    stage=stage,
-                                    save_path=f"./damage_evolution/damage_{g_ep:05d}.png")
-                except Exception:
-                    pass
-
         print(f"Stage {stage} done | final loss {ep_loss:.3e}")
         return ep_loss
 
     # ── L-BFGS (Stage 1 only) ─────────────────────────────────────────────────
 
     def train_lbfgs(self, epochs=1000, tol=1e-8, max_iter=50,
-                    subset=C.PDE_LBFGS_SUBSET, lr=0.1):
+                    subset=None, lr=0.1):
         if self.stage != 1:
             print("L-BFGS is only used in Stage 1."); return 0.0
 
-        params = list(self.net.parameters())
+        if epochs < 1 or self.t_pde is None:
+            raise ValueError('L-BFGS requires positive epochs and PDE points.')
+        params = [p for p in self.net.parameters() if p.requires_grad]
         opt = torch.optim.LBFGS(params, lr=lr, max_iter=max_iter,
                                  tolerance_grad=tol, tolerance_change=tol,
                                  history_size=100, line_search_fn='strong_wolfe')
         N_pde = len(self.t_pde)
-        use_sub = min(subset, N_pde)
+        use_sub = min(C.PDE_LBFGS_SUBSET if subset is None else subset, N_pde)
+        if use_sub < 1:
+            raise ValueError('PDE subset must be positive.')
+        # Keep a single deterministic objective throughout Wolfe line search.
+        idx = torch.randperm(N_pde, device=self.device)[:use_sub]
         losses, pde_l, data_l, gnorms = [], [], [], []
         best_loss, best_params = float('inf'), None
 
         def closure():
             opt.zero_grad()
-            idx = torch.randperm(N_pde, device=self.device)[:use_sub]
             loss, lpde, ldata, _, _ = self.compute_loss(
                 self.t_pde[idx], self.x_pde[idx], self.y_pde[idx],
                 self.t_data, self.x_data, self.y_data, self.u_data,
                 self.global_step)
-            if not torch.isnan(loss): loss.backward()
+            if not torch.isfinite(loss):
+                raise FloatingPointError('Non-finite L-BFGS loss.')
+            loss.backward()
             g = sum(p.grad.norm(2).item()**2 for p in params if p.grad is not None) ** 0.5
             closure.vals = (loss.item(), lpde.item(), ldata.item(), g)
             return loss
@@ -467,6 +511,8 @@ class PINN:
         for ep in range(1, epochs + 1):
             self.global_step += 1
             opt.step(closure)
+            # Reevaluate the accepted weights, rather than a rejected line-search trial.
+            closure()
             lv, pv, dv, gv = closure.vals
             losses.append(lv);  pde_l.append(pv);  data_l.append(dv);  gnorms.append(gv)
             if lv < best_loss:
@@ -482,51 +528,70 @@ class PINN:
         self.lbfgs_loss_hist = losses;  self.lbfgs_pde_hist = pde_l
         self.lbfgs_data_hist = data_l;  self.lbfgs_grad_norms = gnorms
         print(f"L-BFGS done | best loss {best_loss:.6e} | {len(losses)} iters")
-        return losses[-1]
+        return best_loss
 
     # ── Persistence ──────────────────────────────────────────────────────────
 
     def save_model(self, path):
-        torch.save({
-            'net': self.net.state_dict(),
-            'raw_alpha': self.raw_alpha.data,
-            'raw_x_i':  self.raw_x_i.data,
-            'raw_y_i':  self.raw_y_i.data,
-            'raw_r_i':  self.raw_r_i.data,
-            'stage':    self.stage,
-            'ep_log':   self.ep_log,
-            'loss_log': self.loss_log, 'loss_pde_log': self.loss_pde_log,
-            'loss_data_log': self.loss_data_log,
-            'loss_reg_r_log': self.loss_reg_r_log,
-            'loss_reg_g_log': self.loss_reg_g_log,
-            'beta_log': self.beta_log,
-            'damage_ep_hist': self.damage_ep_hist,
-            'alpha_hist': self.alpha_hist, 'x_i_hist': self.x_i_hist,
-            'y_i_hist':  self.y_i_hist,   'r_i_hist': self.r_i_hist,
-            'lbfgs_loss_hist': self.lbfgs_loss_hist,
-            'lbfgs_pde_hist':  self.lbfgs_pde_hist,
-            'lbfgs_data_hist': self.lbfgs_data_hist,
-            'lbfgs_grad_norms': self.lbfgs_grad_norms,
-            'gradient_history': self.gradient_history,
-            'gradient_epochs':  self.gradient_epochs,
-        }, path)
-        print(f"Model saved → {path}")
+        """Stage-transfer checkpoint (not exact optimizer/RNG resume)."""
+        from pathlib import Path
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        fields = ('E', 'nu', 'rho', 'h', 'Lx', 'Ly', 'T_phys', 'D', 'delta_sig', 'beta')
+        checkpoint = dict(
+            format_version=2, net=self.net.state_dict(), layers=self.layers,
+            physics={name: getattr(self, name) for name in fields},
+            stage=self.stage, global_step=self.global_step,
+            finetune_mode=self.finetune_mode, radius_released=self.radius_released,
+            lb=self.lb, ub=self.ub,
+            loss_weights=[self.w_pde, self.w_data, self.w_reg_r, self.w_reg_g],
+        )
+        for name in ('raw_alpha', 'raw_x_i', 'raw_y_i', 'raw_r_i'):
+            checkpoint[name] = getattr(self, name).detach()
+        # Convert numpy history entries to primitives for safe weights-only loading.
+        def plain(value):
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, list):
+                return [plain(item) for item in value]
+            if isinstance(value, dict):
+                return {key: plain(item) for key, item in value.items()}
+            return value
+        for name in self._history_fields():
+            checkpoint[name] = plain(getattr(self, name))
+        torch.save(checkpoint, path)
+
+    @staticmethod
+    def _history_fields():
+        return ('ep_log', 'loss_log', 'loss_pde_log', 'loss_data_log',
+                'loss_reg_r_log', 'loss_reg_g_log', 'beta_log', 'damage_ep_hist',
+                'alpha_hist', 'x_i_hist', 'y_i_hist', 'r_i_hist', 'lbfgs_loss_hist',
+                'lbfgs_pde_hist', 'lbfgs_data_hist', 'lbfgs_grad_norms',
+                'gradient_history', 'gradient_epochs')
 
     def load_model(self, path):
-        ck = torch.load(path, map_location=self.device)
+        ck = torch.load(path, map_location=self.device, weights_only=True)
+        if ck.get('format_version') != 2:
+            raise ValueError('Legacy checkpoint lacks physical metadata; retrain this version.')
+        if ck['layers'] != self.layers:
+            raise ValueError('Architecture differs; use the checkpoint run configuration.')
         self.net.load_state_dict(ck['net'])
-        self.raw_alpha.data = ck['raw_alpha']
-        self.raw_x_i.data   = ck['raw_x_i']
-        self.raw_y_i.data   = ck['raw_y_i']
-        self.raw_r_i.data   = ck['raw_r_i']   # bug fix: was loading raw_x_i here
-        self.stage          = ck['stage']
-        for attr in ('ep_log','loss_log','loss_pde_log','loss_data_log',
-                     'loss_reg_r_log','loss_reg_g_log','beta_log',
-                     'damage_ep_hist','alpha_hist','x_i_hist','y_i_hist','r_i_hist',
-                     'lbfgs_loss_hist','lbfgs_pde_hist','lbfgs_data_hist',
-                     'lbfgs_grad_norms','gradient_history','gradient_epochs'):
-            setattr(self, attr, ck.get(attr, []))
-        print(f"Model loaded ← {path} (stage {self.stage})")
+        for name, value in ck['physics'].items():
+            setattr(self, name, value)
+        with torch.no_grad():
+            for name in ('raw_alpha', 'raw_x_i', 'raw_y_i', 'raw_r_i'):
+                getattr(self, name).copy_(ck[name])
+        self.lb, self.ub = ck['lb'], ck['ub']
+        self.finetune_mode = ck['finetune_mode']
+        self.set_stage(ck['stage'])
+        self.radius_released = ck['radius_released']
+        self._build_optimizer()
+        self.global_step = ck['global_step']
+        self.w_pde, self.w_data, self.w_reg_r, self.w_reg_g = ck['loss_weights']
+        for name in self._history_fields():
+            setattr(self, name, ck[name])
+
 
     def save_damage_params(self, path):
         np.savez(path,
@@ -568,7 +633,12 @@ class PINN:
         ri = self.r_i.detach().cpu().numpy()
 
         k_max = int(np.argmax(a))
-        results = dict(rmse_data=rmse,
+        candidates = [dict(alpha=float(a[k]), x=float(xi[k]), y=float(yi[k]),
+                           x_mm=float(xi[k] * self.Lx * 1000),
+                           y_mm=float(yi[k] * self.Ly * 1000),
+                           radius_mm=float(ri[k] * 1000)) for k in range(self.n_max)]
+        results = dict(rmse_data=rmse, candidates=candidates,
+                       metric_scope='training_observations',
                        main_alpha=float(a[k_max]),
                        main_x=float(xi[k_max]),
                        main_y=float(yi[k_max]),
