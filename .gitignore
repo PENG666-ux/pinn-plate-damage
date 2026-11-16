@@ -21,6 +21,10 @@ stage_*_snapshots/
 # ── Generated plots ───────────────────────────────────────────────────────────
 *.png
 *.gif
+# Original manuscript assets are intentionally versioned.
+!damage.png
+!result_1.png
+!docs/figures/*.png
 # Allow plots committed intentionally to results/
 !results/*.png
 

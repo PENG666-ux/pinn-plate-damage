@@ -1,0 +1,59 @@
+{
+  "source": "PAPER.pdf supplied for this project",
+  "manuscript_title": "U-PINN: Damage inference in thin-plate structures from sparse UGW sensor data using a two-stage physics-informed neural network",
+  "source_pdf_sha256": "ae99f474cc2c7dd0f5e8bf309c98d2f9778e89efcb0c8d2f9c02775a7bb5261c",
+  "figures": [
+    {
+      "figure": 2,
+      "pdf_page": 6,
+      "path": "docs/figures/figure-02-stage-i.jpg",
+      "caption": "Architecture and training workflow of the Stage-I PINN-TL model.",
+      "xref": 60,
+      "width_px": 1975,
+      "height_px": 1382,
+      "source_image_sha256": "67d20cbb73a12796dd2946216bb8f0509817213a5320b2664afa8134ff29030a",
+      "asset_sha256": "67d20cbb73a12796dd2946216bb8f0509817213a5320b2664afa8134ff29030a",
+      "conversion": "Original embedded JPEG bytes, unchanged.",
+      "evidence": "Paper-reported figure; not an output of a repository run."
+    },
+    {
+      "figure": 3,
+      "pdf_page": 8,
+      "path": "docs/figures/figure-03-inversion.jpg",
+      "caption": "Architecture and trainable-parameter flow of the U-PINN model for damage inference.",
+      "xref": 66,
+      "width_px": 2013,
+      "height_px": 933,
+      "source_image_sha256": "7562cc685b9cc8c22afa4d0dc569ad6dbcb53407c370978d130bd3e6a90ca1f1",
+      "asset_sha256": "7562cc685b9cc8c22afa4d0dc569ad6dbcb53407c370978d130bd3e6a90ca1f1",
+      "conversion": "Original embedded JPEG bytes, unchanged.",
+      "evidence": "Paper-reported figure; not an output of a repository run."
+    },
+    {
+      "figure": 7,
+      "pdf_page": 12,
+      "path": "damage.png",
+      "caption": "Damage evolution during the training process, with three snapshots shown for each case at different training iterations.",
+      "xref": 83,
+      "width_px": 1931,
+      "height_px": 1259,
+      "source_image_sha256": "e85b93236a231270b3dca3144d0e00672cc2148d3b788df35420ec7b50954ff8",
+      "asset_sha256": "5905d867672135edd69848f4063e831ae35195a897ae1d58072d047982b7447c",
+      "conversion": "Embedded image decoded to lossless PNG; no resizing or redrawing.",
+      "evidence": "Paper-reported figure; not an output of a repository run."
+    },
+    {
+      "figure": 8,
+      "pdf_page": 13,
+      "path": "result_1.png",
+      "caption": "Optimization trajectories and convergence of the identified damage parameters under different damage cases.",
+      "xref": 86,
+      "width_px": 2020,
+      "height_px": 1230,
+      "source_image_sha256": "296ffbc0f53352982f9b799bdb499ea4e2c5e78f3e81e1285375f91f2e7a1b58",
+      "asset_sha256": "307d6446adfdd20fbb85a249bc04a867d1c7f72c5ba76b97922dffbcf1e79366",
+      "conversion": "Embedded image decoded to lossless PNG; no resizing or redrawing.",
+      "evidence": "Paper-reported figure; not an output of a repository run."
+    }
+  ]
+}
